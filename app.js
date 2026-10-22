@@ -64,6 +64,12 @@ const UI_STATE_KEY = "ensp-web-lab-ui-v1";
 const SERVER_FOLDER_MAX_FILES = 180;
 const SERVER_FILE_PREVIEW_LIMIT = 64 * 1024;
 const SERVER_FOLDER_CONTENT_BUDGET = 768 * 1024;
+// 设备框尺寸：基础值即旧版固定尺寸（96x74），自动模式下按名称重新计算。
+const NODE_BASE_SIZE = { width: 96, height: 74 };
+const NODE_AUTO_LIMITS = { minWidth: 96, maxWidth: 360, minHeight: 74, maxHeight: 200 };
+const NODE_MANUAL_LIMITS = { minWidth: 96, maxWidth: 600, minHeight: 74, maxHeight: 400 };
+const NODE_BODY_INSET = { x: 20, y: 16 };
+let _labelMeasurer = null;
 const state = {
   project: {
     id: "enterprise-campus",
@@ -108,6 +114,8 @@ const state = {
 };
 
 let drag = null;
+let nodeResize = null;
+let handleTap = { id: null, time: 0 };
 let lasso = null;
 let windowDrag = null;
 let stagePan = null;
@@ -216,12 +224,14 @@ function bindToolbar() {
   document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => setTab(tab.dataset.tab)));
   document.querySelectorAll("[data-template]").forEach((btn) => btn.addEventListener("click", () => loadTemplate(btn.dataset.template)));
   document.addEventListener("mousemove", onDragMove);
+  document.addEventListener("mousemove", onNodeResize);
   document.addEventListener("mousemove", onLassoMove);
   document.addEventListener("mousemove", onWindowDrag);
   document.addEventListener("mousemove", onStagePan);
   document.addEventListener("mousemove", onAnnotationDrag);
   document.addEventListener("mousemove", onBottomPanelResize);
   document.addEventListener("mouseup", stopDrag);
+  document.addEventListener("mouseup", stopNodeResize);
   document.addEventListener("mouseup", stopLasso);
   document.addEventListener("mouseup", stopWindowDrag);
   document.addEventListener("mouseup", stopStagePan);
@@ -267,10 +277,11 @@ function dropDevice(event) {
   const model = event.dataTransfer.getData("text/ensp-model");
   if (!type) return;
   const point = stagePoint(event);
-  addDevice(type, { x: point.x - 48, y: point.y - 37 }, { model });
+  addDevice(type, { x: point.x - NODE_BASE_SIZE.width / 2, y: point.y - NODE_BASE_SIZE.height / 2 }, { model });
 }
 
 function renderAll() {
+  syncAllNodeSizes();
   renderLinks();
   renderDevices();
   renderAnnotations();
@@ -292,18 +303,22 @@ function renderDevices() {
   layer.innerHTML = "";
   state.nodes.forEach((node) => {
     const info = deviceInfo(node.type);
+    const size = nodeSize(node);
     const el = document.createElement("div");
     el.className = `device ${isSelected("node", node.id) || state.multiSelected.includes(node.id) ? "selected" : ""}`;
     el.style.left = `${node.x}px`;
     el.style.top = `${node.y}px`;
+    el.style.width = `${size.width}px`;
+    el.style.height = `${size.height}px`;
     el.dataset.id = node.id;
     el.innerHTML = `
       <div class="device-body" style="background:${info.color}">
         <span class="status-dot ${node.running ? "running" : ""}"></span>
         <span class="port-dot top"></span><span class="port-dot right"></span><span class="port-dot bottom"></span><span class="port-dot left"></span>
         <span class="glyph">${info.glyph}</span>
-        <strong title="${node.name}">${node.name}</strong>
-      </div>`;
+        <strong title="${escapeHtml(node.name)}">${escapeHtml(node.name)}</strong>
+      </div>
+      <span class="device-resize-handle" title="拖动调整设备框大小；双击恢复自动尺寸"></span>`;
     el.addEventListener("mousedown", (event) => startDrag(event, node.id));
     el.addEventListener("click", (event) => {
       event.stopPropagation();
@@ -315,6 +330,16 @@ function renderDevices() {
       else openNetworkDeviceWindow(node.id);
     });
     el.addEventListener("contextmenu", (event) => showContextMenu(event, "node", node.id));
+    const handle = el.querySelector(".device-resize-handle");
+    handle.addEventListener("mousedown", (event) => startNodeResize(event, node.id));
+    handle.addEventListener("click", (event) => {
+      if (state.tool === "select") event.stopPropagation();
+    });
+    handle.addEventListener("dblclick", (event) => {
+      if (state.tool !== "select") return;
+      event.stopPropagation();
+      resetNodeSize(node.id);
+    });
     layer.appendChild(el);
   });
 }
@@ -381,12 +406,70 @@ function normalizeStageSize(size = {}) {
   };
 }
 
-function maxNodeX() {
-  return Math.max(16, state.stage.width - 110);
+function maxNodeX(node = null) {
+  const width = node ? nodeSize(node).width : NODE_BASE_SIZE.width;
+  return Math.max(16, state.stage.width - width - 14);
 }
 
-function maxNodeY() {
-  return Math.max(16, state.stage.height - 90);
+function maxNodeY(node = null) {
+  const height = node ? nodeSize(node).height : NODE_BASE_SIZE.height;
+  return Math.max(16, state.stage.height - height - 16);
+}
+
+function nodeSize(node) {
+  if (!node) return { ...NODE_BASE_SIZE };
+  return {
+    width: Number(node.width) || NODE_BASE_SIZE.width,
+    height: Number(node.height) || NODE_BASE_SIZE.height
+  };
+}
+
+function nodeCenter(node) {
+  const size = nodeSize(node);
+  return { x: Number(node?.x) + size.width / 2, y: Number(node?.y) + size.height / 2 };
+}
+
+function labelMeasurer() {
+  if (!_labelMeasurer) {
+    _labelMeasurer = document.createElement("span");
+    _labelMeasurer.className = "device-label-measurer";
+    _labelMeasurer.setAttribute("aria-hidden", "true");
+    document.body.appendChild(_labelMeasurer);
+  }
+  return _labelMeasurer;
+}
+
+function measureNodeLabelWidth(text) {
+  const el = labelMeasurer();
+  el.textContent = String(text ?? "");
+  return el.getBoundingClientRect().width;
+}
+
+function calculateAutoNodeSize(node) {
+  const measured = Math.ceil(measureNodeLabelWidth(node?.name || ""));
+  const bodyWidth = clamp(measured + 12, NODE_BASE_SIZE.width - NODE_BODY_INSET.x, NODE_AUTO_LIMITS.maxWidth - NODE_BODY_INSET.x);
+  const textWidth = Math.max(12, bodyWidth - 8);
+  const lines = Math.max(1, Math.ceil(measured / textWidth));
+  const bodyHeight = clamp(NODE_BASE_SIZE.height - NODE_BODY_INSET.y + (lines - 1) * 13, NODE_BASE_SIZE.height - NODE_BODY_INSET.y, NODE_AUTO_LIMITS.maxHeight - NODE_BODY_INSET.y);
+  return { width: bodyWidth + NODE_BODY_INSET.x, height: bodyHeight + NODE_BODY_INSET.y };
+}
+
+function syncNodeSize(node) {
+  if (!node) return;
+  if (node.autoSize !== false) {
+    const size = calculateAutoNodeSize(node);
+    node.width = size.width;
+    node.height = size.height;
+  } else {
+    node.width = clamp(Number(node.width) || NODE_BASE_SIZE.width, NODE_MANUAL_LIMITS.minWidth, NODE_MANUAL_LIMITS.maxWidth);
+    node.height = clamp(Number(node.height) || NODE_BASE_SIZE.height, NODE_MANUAL_LIMITS.minHeight, NODE_MANUAL_LIMITS.maxHeight);
+  }
+  node.x = clamp(Number.isFinite(Number(node.x)) ? Number(node.x) : 16, 16, maxNodeX(node));
+  node.y = clamp(Number.isFinite(Number(node.y)) ? Number(node.y) : 16, 16, maxNodeY(node));
+}
+
+function syncAllNodeSizes() {
+  state.nodes.forEach(syncNodeSize);
 }
 
 function renderLinks() {
@@ -399,10 +482,12 @@ function renderLinks() {
     const a = getNode(link.a);
     const b = getNode(link.b);
     if (!a || !b) return;
-    const x1 = a.x + 48;
-    const y1 = a.y + 37;
-    const x2 = b.x + 48;
-    const y2 = b.y + 37;
+    const centerA = nodeCenter(a);
+    const centerB = nodeCenter(b);
+    const x1 = centerA.x;
+    const y1 = centerA.y;
+    const x2 = centerB.x;
+    const y2 = centerB.y;
     const diagnostic = linkDiagnostic(link);
     const effectiveStatus = diagnostic.physical;
     const tooltip = `${a.name} ${link.aPort || "Auto"} <-> ${b.name} ${link.bPort || "Auto"}
@@ -592,12 +677,17 @@ function showContextMenu(event, kind, id) {
   if (kind === "node") {
     const node = getNode(id);
     menu.innerHTML = `
-      <button data-action="select">选择 <span>${node.name}</span></button>
+      <button data-action="select">选择 <span>${escapeHtml(node.name)}</span></button>
       <button data-action="power">${node.running ? "停止" : "启动"} <span>Power</span></button>
       <button data-action="cli">打开 CLI <span>&gt;</span></button>
       <button data-action="copy">复制配置 <span>CFG</span></button>
       <button data-action="duplicate">克隆设备 <span>Clone</span></button>
       <button data-action="ping">${state.contextPingSource ? "Ping 到此处" : "设为 Ping 源"} <span>ICMP</span></button>
+      <button data-action="front">置顶 <span>Ctrl+Shift+]</span></button>
+      <button data-action="raise">上移一层 <span>Ctrl+]</span></button>
+      <button data-action="lower">下移一层 <span>Ctrl+[</span></button>
+      <button data-action="back">置底 <span>Ctrl+Shift+[</span></button>
+      ${node.autoSize === false ? '<button data-action="autosize">恢复自动尺寸 <span>Auto</span></button>' : ""}
       <button data-action="delete" class="danger-item">删除 <span>Del</span></button>`;
   } else {
     const link = getLink(id);
@@ -614,6 +704,11 @@ function showContextMenu(event, kind, id) {
     hideContextMenu();
   });
   document.body.appendChild(menu);
+  const rect = menu.getBoundingClientRect();
+  const left = Math.min(Math.max(8, event.clientX), Math.max(8, window.innerWidth - rect.width - 8));
+  const top = Math.min(Math.max(8, event.clientY), Math.max(8, window.innerHeight - rect.height - 8));
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
 }
 
 function showImportMenu(event) {
@@ -646,6 +741,14 @@ function runContextAction(kind, id, action) {
   if (kind === "node") {
     const node = getNode(id);
     if (!node) return;
+    if (["front", "back", "raise", "lower"].includes(action)) {
+      reorderNode(id, action);
+      return;
+    }
+    if (action === "autosize") {
+      resetNodeSize(id);
+      return;
+    }
     if (action === "select") state.selected = { kind: "node", id };
     if (action === "power") setNodePower(node, !node.running);
     if (action === "cli") {
@@ -690,6 +793,8 @@ function duplicateDevice(id) {
   clone.name = `${node.name}_copy`;
   clone.x = node.x + 120;
   clone.y = node.y + 90;
+  clone.x = clamp(clone.x, 16, maxNodeX(clone));
+  clone.y = clamp(clone.y, 16, maxNodeY(clone));
   clone.interfaces.forEach((iface) => {
     iface.ip = "";
     iface.desc = "";
@@ -729,8 +834,8 @@ function onDragMove(event) {
     return;
   }
   const node = getNode(drag.id);
-  node.x = clamp(point.x - drag.dx, 16, maxNodeX());
-  node.y = clamp(point.y - drag.dy, 16, maxNodeY());
+  node.x = clamp(point.x - drag.dx, 16, maxNodeX(node));
+  node.y = clamp(point.y - drag.dy, 16, maxNodeY(node));
   drag.moved = true;
   if (drag.el) {
     drag.el.style.left = `${node.x}px`;
@@ -747,6 +852,115 @@ function stopDrag() {
   }
   drag = null;
   if (moved) renderAll();
+}
+
+function startNodeResize(event, id) {
+  if (state.tool !== "select" || event.button !== 0) return;
+  const node = getNode(id);
+  if (!node) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const now = Date.now();
+  // 双击手柄恢复自动尺寸：在 mousedown 里自行判定，避免 preventDefault 影响浏览器 dblclick。
+  if (handleTap.id === id && now - handleTap.time < 420) {
+    handleTap = { id: null, time: 0 };
+    resetNodeSize(id);
+    return;
+  }
+  handleTap = { id, time: now };
+  const point = stagePoint(event);
+  const size = nodeSize(node);
+  nodeResize = {
+    id,
+    startX: point.x,
+    startY: point.y,
+    startWidth: size.width,
+    startHeight: size.height,
+    moved: false,
+    el: event.currentTarget?.closest(".device") || null
+  };
+  state.selected = { kind: "node", id };
+  state.multiSelected = [];
+  state.multiAnnotations = [];
+  nodeResize.el?.classList.add("selected", "resizing");
+  document.querySelectorAll(".device.selected").forEach((el) => {
+    if (el !== nodeResize.el) el.classList.remove("selected");
+  });
+  renderInspector();
+  renderConfig();
+}
+
+function onNodeResize(event) {
+  if (!nodeResize) return;
+  const node = getNode(nodeResize.id);
+  if (!node) return;
+  const point = stagePoint(event);
+  if (!nodeResize.moved) {
+    if (Math.abs(point.x - nodeResize.startX) < 1 && Math.abs(point.y - nodeResize.startY) < 1) return;
+    nodeResize.moved = true;
+    handleTap = { id: null, time: 0 };
+    node.autoSize = false;
+    renderInspector();
+  }
+  const limitX = Math.max(NODE_MANUAL_LIMITS.minWidth, state.stage.width - node.x - 16);
+  const limitY = Math.max(NODE_MANUAL_LIMITS.minHeight, state.stage.height - node.y - 16);
+  node.width = clamp(nodeResize.startWidth + point.x - nodeResize.startX, NODE_MANUAL_LIMITS.minWidth, Math.min(NODE_MANUAL_LIMITS.maxWidth, limitX));
+  node.height = clamp(nodeResize.startHeight + point.y - nodeResize.startY, NODE_MANUAL_LIMITS.minHeight, Math.min(NODE_MANUAL_LIMITS.maxHeight, limitY));
+  if (nodeResize.el) {
+    nodeResize.el.style.width = `${node.width}px`;
+    nodeResize.el.style.height = `${node.height}px`;
+  }
+  const widthInput = $("nodeWidth");
+  const heightInput = $("nodeHeight");
+  if (widthInput) widthInput.value = Math.round(node.width);
+  if (heightInput) heightInput.value = Math.round(node.height);
+  renderLinks();
+}
+
+function stopNodeResize() {
+  if (!nodeResize) return;
+  const moved = nodeResize.moved;
+  const node = getNode(nodeResize.id);
+  nodeResize.el?.classList.remove("resizing");
+  nodeResize = null;
+  if (!moved) return;
+  if (node) log("info", "RESIZE", `${node.name} 设备框 ${Math.round(node.width)}x${Math.round(node.height)}`);
+  renderAll();
+}
+
+function resetNodeSize(id) {
+  const node = getNode(id);
+  if (!node) return;
+  const wasAuto = node.autoSize !== false;
+  node.autoSize = true;
+  syncNodeSize(node);
+  if (!wasAuto) log("info", "RESIZE", `${node.name} 恢复自动设备框`);
+  renderAll();
+}
+
+function reorderNode(id, action) {
+  const index = state.nodes.findIndex((node) => node.id === id);
+  if (index < 0) return;
+  const node = state.nodes[index];
+  const last = state.nodes.length - 1;
+  if (action === "front" && index === last) return toast(`${node.name} 已在最上层。`);
+  if (action === "back" && index === 0) return toast(`${node.name} 已在最下层。`);
+  if (action === "raise" && index === last) return toast(`${node.name} 已在最上层。`);
+  if (action === "lower" && index === 0) return toast(`${node.name} 已在最下层。`);
+  state.nodes.splice(index, 1);
+  if (action === "front") state.nodes.push(node);
+  if (action === "back") state.nodes.unshift(node);
+  if (action === "raise") state.nodes.splice(index + 1, 0, node);
+  if (action === "lower") state.nodes.splice(index - 1, 0, node);
+  const labels = { front: "置顶", back: "置底", raise: "上移一层", lower: "下移一层" };
+  log("info", "LAYER", `${node.name} ${labels[action] || action}`);
+  renderAll();
+}
+
+function reorderSelectedNode(action) {
+  if (state.multiSelected.length || selectedItemCount() > 1) return toast("调整图层请先选择单台设备。");
+  if (state.selected?.kind !== "node") return toast("请先选择一台设备。");
+  reorderNode(state.selected.id, action);
 }
 
 function startAnnotationDrag(event, id) {
@@ -829,8 +1043,8 @@ function moveSelectionDrag(selectionDrag, point) {
     const node = getNode(nodeId);
     const original = selectionDrag.nodeOriginals[nodeId];
     if (!node || !original) return;
-    node.x = clamp(original.x + dx, 16, maxNodeX());
-    node.y = clamp(original.y + dy, 16, maxNodeY());
+    node.x = clamp(original.x + dx, 16, maxNodeX(node));
+    node.y = clamp(original.y + dy, 16, maxNodeY(node));
     const el = document.querySelector(`.device[data-id="${nodeId}"]`);
     if (el) {
       el.style.left = `${node.x}px`;
@@ -886,8 +1100,9 @@ function stopLasso() {
   lasso.rect.remove();
   const selectedIds = state.nodes
     .filter((node) => {
-      const cx = node.x + 48;
-      const cy = node.y + 37;
+      const center = nodeCenter(node);
+      const cx = center.x;
+      const cy = center.y;
       return cx >= box.left && cx <= box.right && cy >= box.top && cy <= box.bottom;
     })
     .map((node) => node.id);
@@ -961,8 +1176,11 @@ function addDevice(type, pos = null, options = {}) {
     type,
     model: info.model,
     name: options.name || `${info.glyph}${count}`,
-    x: pos?.x ?? (view.scrollLeft + view.clientWidth / 2) / state.zoom - 48 + count * 12,
-    y: pos?.y ?? (view.scrollTop + view.clientHeight / 2) / state.zoom - 37 + count * 10,
+    x: pos?.x ?? (view.scrollLeft + view.clientWidth / 2) / state.zoom - NODE_BASE_SIZE.width / 2 + count * 12,
+    y: pos?.y ?? (view.scrollTop + view.clientHeight / 2) / state.zoom - NODE_BASE_SIZE.height / 2 + count * 10,
+    width: NODE_BASE_SIZE.width,
+    height: NODE_BASE_SIZE.height,
+    autoSize: true,
     running: options.running ?? state.running,
     interfaces: info.ports.map((name, index) => ({
       name,
@@ -3113,8 +3331,8 @@ function applyStageSizeFromInspector() {
 function resizeStage(width, height) {
   state.stage = normalizeStageSize({ width, height });
   state.nodes.forEach((node) => {
-    node.x = clamp(node.x, 16, maxNodeX());
-    node.y = clamp(node.y, 16, maxNodeY());
+    node.x = clamp(node.x, 16, maxNodeX(node));
+    node.y = clamp(node.y, 16, maxNodeY(node));
   });
   log("info", "CANVAS", `画布大小 ${state.stage.width} x ${state.stage.height}`);
   renderAll();
@@ -3122,9 +3340,26 @@ function resizeStage(width, height) {
 
 function nodeInspector(node) {
   const firstIp = node.interfaces.find((i) => i.ip) || node.interfaces[0];
+  const size = nodeSize(node);
   return `
     <div class="field"><label>名称</label><input id="nodeName" value="${escapeHtml(node.name)}" /></div>
     <div class="field"><label>型号</label><input value="${escapeHtml(node.model)}" disabled /></div>
+    <div class="pc-form">
+      <div class="field"><label>设备框宽度</label><input id="nodeWidth" type="number" min="${NODE_MANUAL_LIMITS.minWidth}" max="${NODE_MANUAL_LIMITS.maxWidth}" step="4" value="${Math.round(size.width)}" /></div>
+      <div class="field"><label>设备框高度</label><input id="nodeHeight" type="number" min="${NODE_MANUAL_LIMITS.minHeight}" max="${NODE_MANUAL_LIMITS.maxHeight}" step="4" value="${Math.round(size.height)}" /></div>
+    </div>
+    <div class="button-row size-row">
+      <button id="nodeAutoSize" ${node.autoSize === false ? "" : "disabled"}>恢复自动尺寸</button>
+      <span class="size-hint">${node.autoSize === false ? "手动尺寸" : "自动：按名称适配"} · 拖右下角缩放，双击手柄恢复自动</span>
+    </div>
+    <div class="field"><label>图层顺序</label>
+      <div class="button-row layer-row">
+        <button id="layerFront">置顶</button>
+        <button id="layerRaise">上移一层</button>
+        <button id="layerLower">下移一层</button>
+        <button id="layerBack">置底</button>
+      </div>
+    </div>
     <div class="field"><label>管理地址</label><input id="nodeIp" value="${escapeHtml(firstIp.ip)}" placeholder="192.168.1.1" /></div>
     <div class="field"><label>掩码/前缀</label><input id="nodeMask" value="${escapeHtml(firstIp.mask)}" placeholder="24 或 255.255.255.0" /></div>
     <div class="button-row">
@@ -3150,10 +3385,38 @@ function portRow(port, index) {
 function bindNodeInspector(node) {
   $("nodeName").addEventListener("input", (e) => {
     node.name = e.target.value || node.name;
+    syncNodeSize(node);
     renderDevices();
+    renderLinks();
     renderConfig();
+    const widthInput = $("nodeWidth");
+    const heightInput = $("nodeHeight");
+    if (widthInput) widthInput.value = Math.round(node.width);
+    if (heightInput) heightInput.value = Math.round(node.height);
     updatePrompt();
   });
+  $("nodeWidth")?.addEventListener("change", (e) => {
+    node.autoSize = false;
+    node.width = Number(e.target.value) || node.width;
+    syncNodeSize(node);
+    renderAll();
+  });
+  $("nodeHeight")?.addEventListener("change", (e) => {
+    node.autoSize = false;
+    node.height = Number(e.target.value) || node.height;
+    syncNodeSize(node);
+    renderAll();
+  });
+  $("nodeAutoSize")?.addEventListener("click", () => {
+    node.autoSize = true;
+    syncNodeSize(node);
+    log("info", "RESIZE", `${node.name} 恢复自动设备框`);
+    renderAll();
+  });
+  $("layerFront")?.addEventListener("click", () => reorderNode(node.id, "front"));
+  $("layerRaise")?.addEventListener("click", () => reorderNode(node.id, "raise"));
+  $("layerLower")?.addEventListener("click", () => reorderNode(node.id, "lower"));
+  $("layerBack")?.addEventListener("click", () => reorderNode(node.id, "back"));
   $("nodeIp").addEventListener("change", (e) => {
     const iface = node.interfaces.find((i) => i.ip) || node.interfaces[0];
     iface.ip = e.target.value.trim();
@@ -4814,6 +5077,14 @@ function handleGlobalHotkeys(event) {
     event.preventDefault();
     fitStage();
   }
+  if (event.code === "BracketRight") {
+    event.preventDefault();
+    reorderSelectedNode(event.shiftKey ? "front" : "raise");
+  }
+  if (event.code === "BracketLeft") {
+    event.preventDefault();
+    reorderSelectedNode(event.shiftKey ? "back" : "lower");
+  }
 }
 
 function selectedNodeIds() {
@@ -4857,8 +5128,8 @@ function pasteSelection() {
     const clone = JSON.parse(JSON.stringify(node));
     clone.id = `n${state.counters.node++}`;
     clone.name = uniqueNodeName(`${node.name}_copy`);
-    clone.x = clamp(node.x + 80, 16, maxNodeX());
-    clone.y = clamp(node.y + 80, 16, maxNodeY());
+    clone.x = clamp(node.x + 80, 16, maxNodeX(clone));
+    clone.y = clamp(node.y + 80, 16, maxNodeY(clone));
     idMap.set(node.id, clone.id);
     pastedIds.push(clone.id);
     state.nodes.push(clone);
@@ -4968,9 +5239,10 @@ function centerNode(id) {
   const node = getNode(id);
   if (!node) return;
   const viewport = $("stageViewport");
+  const center = nodeCenter(node);
   viewport.scrollTo({
-    left: Math.max(0, (node.x + 48) * state.zoom - viewport.clientWidth / 2),
-    top: Math.max(0, (node.y + 37) * state.zoom - viewport.clientHeight / 2),
+    left: Math.max(0, center.x * state.zoom - viewport.clientWidth / 2),
+    top: Math.max(0, center.y * state.zoom - viewport.clientHeight / 2),
     behavior: "smooth"
   });
 }
@@ -4981,8 +5253,10 @@ function centerLink(id) {
   const b = link ? getNode(link.b) : null;
   if (!a || !b) return;
   const viewport = $("stageViewport");
-  const x = (a.x + b.x) / 2 + 48;
-  const y = (a.y + b.y) / 2 + 37;
+  const centerA = nodeCenter(a);
+  const centerB = nodeCenter(b);
+  const x = (centerA.x + centerB.x) / 2;
+  const y = (centerA.y + centerB.y) / 2;
   viewport.scrollTo({
     left: Math.max(0, x * state.zoom - viewport.clientWidth / 2),
     top: Math.max(0, y * state.zoom - viewport.clientHeight / 2),
@@ -4994,8 +5268,9 @@ function centerPath(path = []) {
   const nodes = path.map(getNode).filter(Boolean);
   if (!nodes.length) return;
   const viewport = $("stageViewport");
-  const x = nodes.reduce((sum, node) => sum + node.x + 48, 0) / nodes.length;
-  const y = nodes.reduce((sum, node) => sum + node.y + 37, 0) / nodes.length;
+  const centers = nodes.map(nodeCenter);
+  const x = centers.reduce((sum, center) => sum + center.x, 0) / centers.length;
+  const y = centers.reduce((sum, center) => sum + center.y, 0) / centers.length;
   viewport.scrollTo({
     left: Math.max(0, x * state.zoom - viewport.clientWidth / 2),
     top: Math.max(0, y * state.zoom - viewport.clientHeight / 2),
@@ -5320,13 +5595,19 @@ function ensPInterfaceDisplayName(node, portName) {
 
 function nodeAnchorPoint(node, other) {
   if (!node) return { x: 0, y: 0 };
-  const cx = Number(node.x) + 48;
-  const cy = Number(node.y) + 37;
+  const center = nodeCenter(node);
+  const cx = center.x;
+  const cy = center.y;
   if (!other) return { x: cx, y: cy };
-  const ox = Number(other.x) + 48;
-  const oy = Number(other.y) + 37;
+  const otherCenter = nodeCenter(other);
+  const ox = otherCenter.x;
+  const oy = otherCenter.y;
   const angle = Math.atan2(oy - cy, ox - cx);
-  return { x: cx + Math.cos(angle) * 44, y: cy + Math.sin(angle) * 36 };
+  const size = nodeSize(node);
+  return {
+    x: cx + Math.cos(angle) * Math.max(12, size.width / 2 - 4),
+    y: cy + Math.sin(angle) * Math.max(10, size.height / 2 - 1)
+  };
 }
 
 function normalizeCableName(cable) {
@@ -6031,6 +6312,9 @@ function migrateSavedNode(node) {
     node.model = "Client";
     node.protocols = { ...(node.protocols || {}), "HTTP Client": false };
   }
+  if (node.autoSize === undefined) node.autoSize = true;
+  if (!Number(node.width)) node.width = NODE_BASE_SIZE.width;
+  if (!Number(node.height)) node.height = NODE_BASE_SIZE.height;
   ensureAclStore(node);
   if (node.type === "server") ensureServerServices(node);
   return node;

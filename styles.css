@@ -621,6 +621,43 @@ button:active {
   user-select: none;
 }
 
+.device.resizing {
+  cursor: nwse-resize;
+}
+
+.device-resize-handle {
+  position: absolute;
+  right: 1px;
+  bottom: 1px;
+  z-index: 2;
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  background:
+    linear-gradient(135deg, transparent 0 46%, rgba(255, 255, 255, 0.9) 46% 54%, transparent 54% 100%),
+    linear-gradient(135deg, transparent 0 70%, rgba(255, 255, 255, 0.9) 70% 78%, transparent 78% 100%);
+  opacity: 0;
+  cursor: nwse-resize;
+  transition: opacity 0.12s ease;
+}
+
+.device:hover .device-resize-handle,
+.device.selected .device-resize-handle {
+  opacity: 0.85;
+}
+
+.device-label-measurer {
+  position: absolute;
+  left: -10000px;
+  top: 0;
+  visibility: hidden;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
+
 .annotation {
   position: absolute;
   max-width: 260px;
@@ -667,8 +704,8 @@ button:active {
   display: grid;
   grid-template-rows: 34px 1fr;
   place-items: center;
-  width: 76px;
-  height: 58px;
+  width: calc(100% - 16px);
+  height: calc(100% - 12px);
   border: 1px solid rgba(17, 24, 39, 0.2);
   border-radius: 8px;
   color: #fff;
@@ -688,12 +725,13 @@ button:active {
 }
 
 .device-body strong {
-  max-width: 70px;
+  max-width: calc(100% - 8px);
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  text-align: center;
   font-size: 11px;
-  line-height: 1;
+  line-height: 1.15;
 }
 
 .status-dot {
@@ -777,6 +815,22 @@ button:active {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.size-row {
+  align-items: center;
+}
+
+.size-hint {
+  flex: 1 1 140px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.layer-row button {
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 .button-row button,
@@ -1308,6 +1362,8 @@ th {
   z-index: 80;
   display: grid;
   min-width: 176px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
   padding: 6px;
   border: 1px solid #cbd5e1;
   border-radius: 8px;

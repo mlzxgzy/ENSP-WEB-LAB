@@ -16,6 +16,7 @@ const catalog = [
   { type: "router", model: "NE40E", title: "运营商路由器", glyph: "NE", color: "#1f4f99", cpu: 20, mem: 30, ports: ["GE0/0/0", "GE0/0/1", "10GE0/0/0", "10GE0/0/1"], protocols: ["OSPF", "ISIS", "BGP", "MPLS", "LDP"] },
   { type: "switch", model: "S3700", title: "接入交换机", glyph: "SW", color: "#167c51", cpu: 6, mem: 10, ports: ["GE0/0/1", "GE0/0/2", "GE0/0/3", "GE0/0/4"], protocols: ["VLAN", "STP", "MSTP"] },
   { type: "switch", model: "S5720", title: "千兆交换机", glyph: "SW", color: "#15803d", cpu: 9, mem: 13, ports: ["GE0/0/1", "GE0/0/2", "GE0/0/3", "GE0/0/4", "GE0/0/5", "GE0/0/6", "10GE0/0/1"], protocols: ["VLAN", "STP", "MSTP", "LACP"] },
+  { type: "switch", model: "S5700-28C-EI", title: "可扩展交换机", glyph: "SW+", color: "#0d9488", cpu: 10, mem: 16, ports: ["GE0/0/1", "GE0/0/2", "GE0/0/3", "GE0/0/4", "GE0/0/5", "GE0/0/6", "GE0/0/7", "GE0/0/8"], protocols: ["VLAN", "STP", "MSTP", "LACP"] },
   { type: "switch", model: "S6720", title: "万兆交换机", glyph: "10G", color: "#047857", cpu: 12, mem: 18, ports: ["10GE0/0/1", "10GE0/0/2", "10GE0/0/3", "10GE0/0/4", "GE0/0/1"], protocols: ["VLAN", "STP", "MSTP", "LACP", "Stack"] },
   { type: "l3switch", model: "CE6800", title: "数据中心交换机", glyph: "CE", color: "#0f766e", cpu: 18, mem: 26, ports: ["10GE1/0/1", "10GE1/0/2", "10GE1/0/3", "40GE1/0/1", "Vlanif10"], protocols: ["VLAN", "STP", "OSPF", "BGP", "EVPN"] },
   { type: "firewall", model: "USG5500", title: "企业防火墙", glyph: "FW", color: "#991b1b", cpu: 14, mem: 22, ports: ["GE0/0/0", "GE0/0/1", "GE0/0/2"], protocols: ["Security-Zone", "ACL", "NAT", "IPSec", "Policy"] },
@@ -88,6 +89,13 @@ const FRAME_LAYER_ACTIONS = {
   down: "下移一层",
   up: "上移一层",
   top: "置顶"
+};
+const PORT_KIND_ORDER = ["copper", "fiber", "tenG", "fortyG"];
+const PORT_KIND_META = {
+  copper: { label: "电口", hint: "GE0/0/x" },
+  fiber: { label: "光口", hint: "GE0/1/x" },
+  tenG: { label: "万兆光口", hint: "10GE0/0/x" },
+  fortyG: { label: "40G 光口", hint: "40GE0/0/x" }
 };
 const state = {
   project: {
@@ -276,9 +284,11 @@ function renderPalette() {
     .filter((d) => [d.model, d.title, d.type, d.protocols.join(" ")].join(" ").toLowerCase().includes(q))
     .forEach((d) => {
       const btn = document.createElement("button");
+      const expandable = Boolean(portExpansionLimits({ type: d.type }));
+      const portLabel = `${d.ports.length}口${expandable ? " · 可扩展" : ""}`;
       btn.className = "palette-item";
       btn.draggable = true;
-      btn.innerHTML = `<span class="icon" style="background:${d.color}">${d.glyph}</span><span><strong>${d.model}</strong><span>${d.title} · ${d.protocols.slice(0, 3).join("/")}</span></span><small>${d.ports.length}口</small>`;
+      btn.innerHTML = `<span class="icon" style="background:${d.color}">${d.glyph}</span><span><strong>${d.model}</strong><span>${d.title} · ${d.protocols.slice(0, 3).join("/")}</span></span><small title="${expandable ? "支持扩展电口、光口、万兆光和 40G 光口" : ""}">${portLabel}</small>`;
       btn.addEventListener("click", () => addDevice(d.type, null, { model: d.model }));
       btn.addEventListener("dragstart", (event) => event.dataTransfer.setData("text/ensp-device", d.type));
       btn.addEventListener("dragstart", (event) => event.dataTransfer.setData("text/ensp-model", d.model));
@@ -328,7 +338,7 @@ function renderDevices() {
   const layer = $("deviceLayer");
   layer.innerHTML = "";
   state.nodes.forEach((node) => {
-    const info = deviceInfo(node.type);
+    const info = deviceInfo(node.type, node.model);
     const size = nodeSize(node);
     const el = document.createElement("div");
     el.className = `device ${isSelected("node", node.id) || state.multiSelected.includes(node.id) ? "selected" : ""}`;
@@ -945,6 +955,7 @@ function showContextMenu(event, kind, id) {
       <button data-action="select">选择 <span>${escapeHtml(node.name)}</span></button>
       <button data-action="power">${node.running ? "停止" : "启动"} <span>Power</span></button>
       <button data-action="cli">打开 CLI <span>&gt;</span></button>
+      ${isExpandableNode(node) ? '<button data-action="ports">接口扩展 <span>Ports</span></button>' : ""}
       <button data-action="copy">复制配置 <span>CFG</span></button>
       <button data-action="duplicate">克隆设备 <span>Clone</span></button>
       <button data-action="ping">${state.contextPingSource ? "Ping 到此处" : "设为 Ping 源"} <span>ICMP</span></button>
@@ -1035,6 +1046,7 @@ function runContextAction(kind, id, action) {
       state.selected = { kind: "node", id };
       setTab("cli");
     }
+    if (action === "ports") openPortExpansionDialog(node);
     if (action === "copy") {
       state.selected = { kind: "node", id };
       renderConfig();
@@ -1651,6 +1663,7 @@ function addDevice(type, pos = null, options = {}) {
     running: options.running ?? state.running,
     interfaces: info.ports.map((name, index) => ({
       name,
+      portKind: inferPortKind({ name }),
       status: "up",
       ip: "",
       mask: "",
@@ -1793,6 +1806,322 @@ function usedPorts(nodeId) {
     if (link.b === nodeId) used.add(link.bPort);
   });
   return used;
+}
+
+// ---- 交换机接口扩展 ----
+
+function portExpansionLimits(node) {
+  if (!node) return null;
+  if (node.type === "switch") return { copper: 48, fiber: 24, tenG: 8, fortyG: 4 };
+  if (node.type === "l3switch") return { copper: 48, fiber: 24, tenG: 16, fortyG: 8 };
+  return null;
+}
+
+function isExpandableNode(node) {
+  return Boolean(portExpansionLimits(node));
+}
+
+function inferPortKind(iface) {
+  if (iface?.portKind) return iface.portKind;
+  const name = String(iface?.name || "");
+  if (/^40GE|^FortyGig/i.test(name)) return "fortyG";
+  if (/^10GE|^TenGig/i.test(name)) return "tenG";
+  if (/^Serial/i.test(name)) return "serial";
+  if (/^(Wlan|WLAN)/i.test(name)) return "wireless";
+  if (/^Vlanif/i.test(name)) return "virtual";
+  if (/\.\d+$/.test(name)) return "subinterface";
+  const ge = name.match(/^(?:GE|GigabitEthernet)(\d+)\/(\d+)\/\d+$/i);
+  if (ge) return Number(ge[2]) === 0 ? "copper" : "fiber";
+  if (/^(GE|GigabitEthernet|Ethernet|Eth)/i.test(name)) return "copper";
+  return "other";
+}
+
+function portCountsByKind(node) {
+  const counts = Object.fromEntries(PORT_KIND_ORDER.map((kind) => [kind, []]));
+  (node?.interfaces || []).forEach((iface) => {
+    const kind = inferPortKind(iface);
+    if (counts[kind]) counts[kind].push(iface);
+  });
+  return counts;
+}
+
+function portBreakdownText(node) {
+  if (!isExpandableNode(node)) return "";
+  const counts = portCountsByKind(node);
+  return PORT_KIND_ORDER.map((kind) => `${PORT_KIND_META[kind].label} ${counts[kind].length}`).join(" · ");
+}
+
+function portPrefixForKind(node, kind) {
+  const interfaces = node?.interfaces || [];
+  const existingPrefix = (targetKind) => {
+    const sample = interfaces.find((iface) => inferPortKind(iface) === targetKind);
+    return sample ? String(sample.name).replace(/\d+$/, "") : "";
+  };
+  const copperPrefix = existingPrefix("copper") || "GE0/0/";
+  if (kind === "copper") return copperPrefix;
+  if (kind === "fiber") {
+    const fiberPrefix = existingPrefix("fiber");
+    if (fiberPrefix) return fiberPrefix;
+    return copperPrefix.replace(/^(.*\/)(\d+)\/$/, (_, head, slot) => `${head}${Number(slot) + 1}/`) || "GE0/1/";
+  }
+  if (kind === "tenG") return existingPrefix("tenG") || "10GE0/0/";
+  if (kind === "fortyG") return existingPrefix("fortyG") || "40GE0/0/";
+  return "";
+}
+
+function allocatePortName(prefix, usedNames) {
+  let max = 0;
+  usedNames.forEach((name) => {
+    if (!String(name).startsWith(prefix)) return;
+    const tail = String(name).slice(prefix.length);
+    if (/^\d+$/.test(tail)) max = Math.max(max, Number(tail));
+  });
+  let index = max + 1;
+  while (usedNames.has(`${prefix}${index}`)) index += 1;
+  return `${prefix}${index}`;
+}
+
+function sortPortsDesc(ports) {
+  return [...ports].sort((a, b) => {
+    const aNumber = Number(String(a.name).match(/(\d+)$/)?.[1] || 0);
+    const bNumber = Number(String(b.name).match(/(\d+)$/)?.[1] || 0);
+    return bNumber - aNumber || String(b.name).localeCompare(String(a.name));
+  });
+}
+
+function planPortCountChange(node, targets) {
+  const limits = portExpansionLimits(node);
+  if (!limits) return { ok: false, error: "该设备不支持接口扩展。" };
+  const before = portCountsByKind(node);
+  const entries = PORT_KIND_ORDER.map((kind) => {
+    const raw = targets?.[kind];
+    const target = typeof raw === "string" && raw.trim() === "" ? NaN : Number(raw);
+    return {
+      kind,
+      label: PORT_KIND_META[kind].label,
+      current: before[kind].length,
+      target,
+      cap: Math.max(limits[kind], before[kind].length)
+    };
+  });
+  for (const entry of entries) {
+    if (!Number.isInteger(entry.target) || entry.target < 0) {
+      return { ok: false, error: `${entry.label}数量必须是非负整数。` };
+    }
+    if (entry.target > entry.cap) {
+      return { ok: false, error: `${entry.label}最多 ${entry.cap} 个（当前 ${entry.current} 个）。` };
+    }
+  }
+  if (entries.every((entry) => entry.target === 0)) {
+    return { ok: false, error: "至少保留 1 个可配置接口（电口/光口/万兆/40G）。" };
+  }
+  const used = usedPorts(node.id);
+  const removals = [];
+  const removalsWithSub = [];
+  for (const entry of entries) {
+    const removeCount = entry.current - entry.target;
+    if (removeCount <= 0) continue;
+    sortPortsDesc(before[entry.kind]).slice(0, removeCount).forEach((iface) => {
+      removals.push(iface);
+      removalsWithSub.push(iface.name);
+      node.interfaces
+        .filter((item) => String(item.name).startsWith(`${iface.name}.`))
+        .forEach((sub) => {
+          if (!removalsWithSub.includes(sub.name)) removalsWithSub.push(sub.name);
+        });
+    });
+  }
+  const usedNormalized = new Set([...used].map((port) => normalizeInterfaceName(port)));
+  const blocked = removalsWithSub.filter((name) => used.has(name) || usedNormalized.has(normalizeInterfaceName(name)));
+  if (blocked.length) {
+    return { ok: false, error: `以下接口仍有链路连接，无法移除：${blocked.join("、")}。请先删除或改接这些链路。` };
+  }
+  const removeSet = new Set(removalsWithSub);
+  const usedNames = new Set([
+    ...node.interfaces.filter((iface) => !removeSet.has(iface.name)).map((iface) => iface.name),
+    ...used
+  ]);
+  const additions = [];
+  for (const entry of entries) {
+    const addCount = entry.target - entry.current;
+    if (addCount <= 0) continue;
+    const prefix = portPrefixForKind(node, entry.kind);
+    for (let index = 0; index < addCount; index += 1) {
+      const name = allocatePortName(prefix, usedNames);
+      usedNames.add(name);
+      additions.push({ name, portKind: entry.kind });
+    }
+  }
+  return {
+    ok: true,
+    before: Object.fromEntries(entries.map((entry) => [entry.kind, entry.current])),
+    after: Object.fromEntries(entries.map((entry) => [entry.kind, entry.target])),
+    removals,
+    removalsWithSub,
+    additions,
+    totalBefore: node.interfaces.length,
+    totalAfter: node.interfaces.length - removalsWithSub.length + additions.length
+  };
+}
+
+function commitPortCountChange(node, plan) {
+  if (!plan?.ok) return false;
+  const removeSet = new Set(plan.removalsWithSub);
+  node.interfaces = node.interfaces.filter((iface) => !removeSet.has(iface.name));
+  plan.additions.forEach((item) => {
+    node.interfaces.push({
+      name: item.name,
+      portKind: item.portKind,
+      status: "up",
+      ip: "",
+      mask: "",
+      vlan: "1",
+      linkType: "access",
+      trunkAllow: [],
+      dot1q: "",
+      arpBroadcast: false,
+      ospf: null,
+      dhcpSelect: "",
+      desc: ""
+    });
+  });
+  node.interfaces.forEach((iface) => {
+    if (!iface.portKind) iface.portKind = inferPortKind(iface);
+  });
+  const summary = PORT_KIND_ORDER
+    .filter((kind) => plan.before[kind] !== plan.after[kind])
+    .map((kind) => `${PORT_KIND_META[kind].label} ${plan.before[kind]}→${plan.after[kind]}`)
+    .join("，");
+  log("ok", "IFACE", `${node.name} 接口调整：${summary || "无变化"}`);
+  toast(`接口已更新：${summary || "无变化"}`);
+  renderAll();
+  return true;
+}
+
+function portSummarySignature(node) {
+  return node.interfaces.map((iface) => `${iface.name}:${iface.status}:${iface.ip}:${iface.mask}:${iface.vlan}`).join("|");
+}
+
+function portSummaryHtml(node) {
+  const expandable = isExpandableNode(node);
+  return `
+    <div class="port-summary-head">
+      <span>${node.interfaces.length} 个接口${expandable ? ` · ${portBreakdownText(node)}` : ""}</span>
+      ${expandable ? "<button data-expand-ports>接口扩展</button>" : ""}
+    </div>
+    <div class="port-list">${node.interfaces.map((port, index) => portRow(port, index)).join("")}</div>`;
+}
+
+function openPortExpansionDialog(node) {
+  if (!node || !getNode(node.id)) return;
+  const limits = portExpansionLimits(node);
+  if (!limits) {
+    toast("只有交换机支持接口扩展。");
+    return;
+  }
+  document.querySelector(".port-dialog")?.remove();
+  const counts = portCountsByKind(node);
+  const used = usedPorts(node.id);
+  const rows = PORT_KIND_ORDER.map((kind) => {
+    const meta = PORT_KIND_META[kind];
+    const current = counts[kind].length;
+    const cap = Math.max(limits[kind], current);
+    const usedCount = counts[kind].filter((iface) => used.has(iface.name)).length;
+    return `
+      <label class="port-kind-row">
+        <span class="port-kind-meta"><strong>${meta.label}</strong><small title="${meta.hint}">${portPrefixForKind(node, kind)}x</small></span>
+        <span class="port-kind-count">当前 <strong>${current}</strong> · 占用 <strong>${usedCount}</strong> · 上限 ${limits[kind]}</span>
+        <span class="port-kind-input"><input type="number" min="0" max="${cap}" step="1" value="${current}" data-kind-input="${kind}" /></span>
+      </label>`;
+  }).join("");
+  const quickRow = PORT_KIND_ORDER.map((kind) => {
+    const add = kind === "fortyG" ? 1 : kind === "tenG" ? 2 : 4;
+    return `<button data-quick-kind="${kind}" data-quick-add="${add}">+${add} ${PORT_KIND_META[kind].label}</button>`;
+  }).join("");
+  const dialog = document.createElement("div");
+  dialog.className = "link-dialog port-dialog";
+  dialog.innerHTML = `
+    <div class="link-dialog-card port-dialog-card" role="dialog" aria-modal="true">
+      <h3>接口扩展 — ${escapeHtml(node.name)}（${escapeHtml(node.model)}）</h3>
+      <p class="port-dialog-hint">按类型调整接口数量。减少时从最大编号开始移除；仍有链路连接的接口不会被移除，子接口会随父接口一起移除。</p>
+      <div class="port-kind-list">${rows}</div>
+      <div class="port-quick-row">${quickRow}</div>
+      <div class="port-dialog-preview" data-port-preview></div>
+      <div class="port-dialog-error" data-port-error hidden></div>
+      <div class="button-row">
+        <button class="primary-btn" data-port-apply>应用</button>
+        <button data-port-cancel>取消</button>
+      </div>
+    </div>`;
+  document.body.appendChild(dialog);
+
+  const readTargets = () => Object.fromEntries(
+    PORT_KIND_ORDER.map((kind) => [kind, dialog.querySelector(`[data-kind-input="${kind}"]`).value])
+  );
+  const refresh = () => {
+    const plan = planPortCountChange(node, readTargets());
+    const error = dialog.querySelector("[data-port-error]");
+    const preview = dialog.querySelector("[data-port-preview]");
+    if (!plan.ok) {
+      error.textContent = plan.error;
+      error.hidden = false;
+      preview.textContent = "";
+      return null;
+    }
+    error.hidden = true;
+    const added = plan.additions.map((item) => item.name);
+    const removed = plan.removals.map((item) => item.name);
+    const shortList = (list) => `${list.slice(0, 6).join("、")}${list.length > 6 ? "…" : ""}`;
+    preview.textContent = `应用后约 ${plan.totalAfter} 个接口；新增 ${added.length} 个${added.length ? `（${shortList(added)}）` : ""}${removed.length ? `，移除 ${removed.length} 个（${shortList(removed)}）` : ""}。`;
+    return plan;
+  };
+  const apply = () => {
+    const plan = refresh();
+    if (!plan) return;
+    if (!plan.additions.length && !plan.removals.length) {
+      toast("接口数量没有变化。");
+      return;
+    }
+    if (!getNode(node.id)) {
+      dialog.remove();
+      return;
+    }
+    if (plan.removals.length) {
+      const names = plan.removals.map((iface) => iface.name).join("、");
+      if (!window.confirm(`将移除 ${plan.removals.length} 个接口：${names}。\n相关接口配置会一并清除，是否继续？`)) return;
+    }
+    commitPortCountChange(node, plan);
+    dialog.remove();
+  };
+
+  dialog.addEventListener("click", (event) => {
+    if (event.target === dialog || event.target.closest("[data-port-cancel]")) dialog.remove();
+    if (event.target.closest("[data-port-apply]")) apply();
+    const quick = event.target.closest("[data-quick-kind]");
+    if (quick) {
+      const kind = quick.dataset.quickKind;
+      const input = dialog.querySelector(`[data-kind-input="${kind}"]`);
+      const cap = Number(input.max);
+      input.value = String(Math.min(cap, (Number(input.value) || 0) + Number(quick.dataset.quickAdd)));
+      refresh();
+    }
+  });
+  dialog.querySelectorAll("[data-kind-input]").forEach((input) => input.addEventListener("input", refresh));
+  dialog.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      dialog.remove();
+      return;
+    }
+    if (event.key === "Enter" && event.target.matches("input")) {
+      event.preventDefault();
+      event.stopPropagation();
+      apply();
+    }
+  });
+  refresh();
+  dialog.querySelector("[data-kind-input]")?.focus();
 }
 
 function renderInspector() {
@@ -2035,7 +2364,7 @@ function openNetworkDeviceWindow(id) {
         </div>
       </div>
       <div data-window-panel="summary" ${node.running ? "hidden" : ""}>
-        <div class="port-list">${node.interfaces.map((p, index) => portRow(p, index)).join("")}</div>
+        ${portSummaryHtml(node)}
       </div>
     </div>`;
   document.body.appendChild(win);
@@ -2068,6 +2397,19 @@ function bindNetworkDeviceWindow(win, node) {
     win.remove();
     saveUiState();
   });
+  win.querySelector('[data-window-panel="summary"]')?.addEventListener("click", (event) => {
+    if (event.target.closest("[data-expand-ports]")) {
+      openPortExpansionDialog(node);
+      return;
+    }
+    const btn = event.target.closest("[data-port]");
+    if (!btn) return;
+    const port = node.interfaces[Number(btn.dataset.port)];
+    if (!port) return;
+    port.status = port.status === "up" ? "down" : "up";
+    log("info", "IFACE", `${node.name} ${port.name} ${port.status}`);
+    renderAll();
+  });
   win.querySelectorAll("[data-window-tab]").forEach((tab) => {
     tab.addEventListener("click", () => {
       if (tab.dataset.windowTab === "console" && !requireNodeRunning(node, "VRP Console")) return;
@@ -2088,8 +2430,6 @@ function bindNetworkDeviceWindow(win, node) {
     appendVrpConsole(win, `${vrpPrompt(node, session)} ${cmd}`);
     runVrpWindowCommand(win, node, session, cmd);
     updateEchoPrompt();
-    const summary = win.querySelector('[data-window-panel="summary"] .port-list');
-    if (summary) summary.innerHTML = node.interfaces.map((p, index) => portRow(p, index)).join("");
   });
 }
 
@@ -3846,6 +4186,7 @@ function nodeInspector(node) {
     <div class="button-row">
       <button id="nodePower" class="primary-btn">${node.running ? "停止设备" : "启动设备"}</button>
       <button id="openCli">打开 CLI</button>
+      ${isExpandableNode(node) ? '<button id="expandPorts">接口扩展</button>' : ""}
       <button id="toggleOspf">OSPF</button>
       <button id="toggleVlan">VLAN</button>
       <button id="deleteNode" class="danger-btn">删除</button>
@@ -3855,6 +4196,7 @@ function nodeInspector(node) {
       <div><span>接口</span><strong>${node.interfaces.length}</strong></div>
       <div><span>协议</span><strong>${Object.entries(node.protocols).filter(([, v]) => v).map(([k]) => k).join(", ") || "未启用"}</strong></div>
     </div>
+    ${isExpandableNode(node) ? `<div class="port-kind-summary">${portBreakdownText(node)}</div>` : ""}
     <div class="field"><label>接口</label><div class="port-list">${node.interfaces.map((p, index) => portRow(p, index)).join("")}</div></div>
     <div class="field"><label>备注</label><textarea id="nodeNotes">${escapeHtml(node.notes)}</textarea></div>`;
 }
@@ -3920,10 +4262,11 @@ function bindNodeInspector(node) {
     if (!requireNodeRunning(node)) return;
     setTab("cli");
   });
+  $("expandPorts")?.addEventListener("click", () => openPortExpansionDialog(node));
   $("toggleOspf").addEventListener("click", () => toggleProtocol(node, "OSPF"));
   $("toggleVlan").addEventListener("click", () => toggleProtocol(node, "VLAN"));
   $("deleteNode").addEventListener("click", () => deleteNode(node.id));
-  document.querySelectorAll("[data-port]").forEach((btn) => {
+  $("inspectorBody").querySelectorAll("[data-port]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const port = node.interfaces[Number(btn.dataset.port)];
       port.status = port.status === "up" ? "down" : "up";
@@ -5575,6 +5918,18 @@ function syncOpenWindows() {
     if (title) {
       title.textContent = win.dataset.endpointWindow ? `${node.name} - ${node.model} 配置` : `${node.name} - VRP Console`;
     }
+    if (win.dataset.vrpWindow) {
+      const summary = win.querySelector('[data-window-panel="summary"]');
+      if (summary) {
+        const signature = portSummarySignature(node);
+        if (summary.dataset.signature !== signature) {
+          const scrollTop = summary.scrollTop;
+          summary.innerHTML = portSummaryHtml(node);
+          summary.dataset.signature = signature;
+          summary.scrollTop = scrollTop;
+        }
+      }
+    }
     const activeTab = win.querySelector("[data-window-tab].active")?.dataset.windowTab;
     if (!node.running && win.dataset.vrpWindow && activeTab === "console") activateWindowTab(win, "summary");
     if (!node.running && win.dataset.endpointWindow && ["cmd", "client"].includes(activeTab)) activateWindowTab(win, "config");
@@ -6907,6 +7262,10 @@ function migrateSavedNode(node) {
   if (!Number(node.height)) node.height = NODE_BASE_SIZE.height;
   ensureAclStore(node);
   if (node.type === "server") ensureServerServices(node);
+  if (!Array.isArray(node.interfaces)) node.interfaces = [];
+  node.interfaces.forEach((iface) => {
+    if (!iface.portKind) iface.portKind = inferPortKind(iface);
+  });
   return node;
 }
 
@@ -7132,6 +7491,7 @@ function findInterfaceByName(node, name) {
   if (!iface) {
     iface = {
       name,
+      portKind: inferPortKind({ name }),
       status: "up",
       ip: "",
       mask: "",

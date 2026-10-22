@@ -1,0 +1,108 @@
+# 静态站点部署：把纯前端文件发布到 gh-pages 分支，由 GitHub Pages 托管。
+#
+# 这个仓库没有构建步骤（原生 HTML/CSS/JS，无 package.json），所以 workflow 只做三件事：
+#   1. 校验 index.html 引用的资源都在
+#   2. 把要上线的静态文件挑出来放进 _site/
+#   3. 用 peaceiris/actions-gh-pages 把 _site/ 推到 gh-pages 分支（orphan 提交，不留历史）
+#
+# ── 首次使用需要手动做一次 ──────────────────────────────────────────────
+# 仓库 Settings → Pages → Build and deployment
+#   Source: Deploy from a branch
+#   Branch: gh-pages  目录: / (root)     ← 本 workflow 第一次跑成功后才会出现 gh-pages
+#   如果配置了自定义域名（例如 README 里的 ensp.closeai.wtf），在 Custom domain 里再填一次；
+#   或者在仓库根目录放一个 CNAME 文件（内容就是域名，例如一行 ensp.closeai.wtf），
+#   本 workflow 会自动把它带上，避免每次部署后自定义域名失效。
+#
+# ── 日常使用 ────────────────────────────────────────────────────────────
+# push 到 main 自动部署；也可以在 Actions 页面点 "Run workflow" 手动部署任意分支/提交。
+# 部署完成后，gh-pages 分支的内容就是线上站点的完整静态文件。
+#
+# 如果部署步骤报 403 / "refusing to allow a GitHub App to create..."，
+# 去 Settings → Actions → General → Workflow permissions 选 "Read and write permissions"。
+
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 只需要写权限：往 gh-pages 分支推提交
+permissions:
+  contents: write
+
+# 同一时间只跑一个部署，新的 push 会取消还没跑完的旧部署
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 校验静态资源
+        run: |
+          set -euo pipefail
+          test -f index.html || { echo "::error::缺少 index.html"; exit 1; }
+
+          # 页面引用的每个本地资源都必须存在，否则线上会白屏
+          missing=0
+          for f in $(grep -oE '(src|href)="\./[^"]+"' index.html | sed -E 's/.*="\.\/([^"]+)"/\1/' | sort -u); do
+            if [ -f "$f" ]; then
+              echo "ok   $f"
+            else
+              echo "::error::index.html 引用了不存在的文件: $f"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+
+          # 纯 JS 工程，至少做一次语法检查（node 在 runner 上是现成的）
+          for js in app.js app-improvements.js command-autocomplete.js; do
+            if [ -f "$js" ]; then node --check "$js" && echo "syntax ok  $js"; fi
+          done
+
+      - name: 组装 _site 目录
+        run: |
+          set -euo pipefail
+          rm -rf _site
+          mkdir -p _site
+
+          # 站点运行必需的文件
+          cp index.html styles.css app.js _site/
+
+          # 可选文件：存在就一起发布（404.html / CNAME / 现有但暂未被 index.html 引用的增强脚本）
+          for f in app-improvements.js command-autocomplete.js styles-improvements.css 404.html CNAME .nojekyll; do
+            if [ -f "$f" ]; then cp "$f" _site/; fi
+          done
+
+          # 关掉 Jekyll，避免下划线开头的文件/目录被吞掉
+          touch _site/.nojekyll
+
+          echo "将发布到 gh-pages 的文件："
+          find _site -maxdepth 1 -type f -printf '%10s  %f\n' | sort -k2
+
+      - name: 发布到 gh-pages 分支
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: ./_site
+          # 每次部署生成一个全新的 orphan 提交，gh-pages 分支不会无限膨胀
+          force_orphan: true
+          user_name: github-actions[bot]
+          user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          commit_message: "deploy: ${{ github.sha }}"
+
+      - name: 写入 Actions 摘要
+        run: |
+          {
+            echo "### 已发布到 gh-pages"
+            echo ""
+            echo "- 提交：\`${{ github.sha }}\`"
+            echo "- 分支：gh-pages（站点文件的完整快照，orphan 提交）"
+            echo "- 如果页面 404，去 Settings → Pages 确认 Source 指向 gh-pages / (root)"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -23,6 +23,7 @@
           <button id="selectTool" class="tool active" title="选择">↖</button>
           <button id="linkTool" class="tool link-tool-strong" title="连接链路">⛓</button>
           <button id="textTool" class="tool" title="文本标注">T</button>
+          <button id="frameTool" class="tool" title="画框">▭</button>
           <button id="deleteTool" class="tool danger" title="删除">⌫</button>
           <button id="toggleLeftPanel" class="tool" title="收起/展开左侧设备栏">◧</button>
           <button id="toggleRightPanel" class="tool" title="收起/展开右侧属性栏">◨</button>
@@ -91,6 +92,7 @@
           <div id="stageViewport" class="stage-viewport">
             <div id="stage" class="stage">
               <svg id="linkLayer" class="link-layer" aria-hidden="true"></svg>
+              <div id="frameLayer" class="frame-layer"></div>
               <div id="deviceLayer" class="device-layer"></div>
               <div id="annotationLayer" class="annotation-layer"></div>
             </div>

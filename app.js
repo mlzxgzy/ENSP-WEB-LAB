@@ -70,6 +70,25 @@ const NODE_AUTO_LIMITS = { minWidth: 96, maxWidth: 360, minHeight: 74, maxHeight
 const NODE_MANUAL_LIMITS = { minWidth: 96, maxWidth: 600, minHeight: 74, maxHeight: 400 };
 const NODE_BODY_INSET = { x: 20, y: 16 };
 let _labelMeasurer = null;
+// 画框：背景分组层（链路之上、设备之下），尺寸/样式/图层顺序随项目保存。
+const FRAME_MIN_WIDTH = 80;
+const FRAME_MIN_HEIGHT = 50;
+const FRAME_DEFAULT_WIDTH = 280;
+const FRAME_DEFAULT_HEIGHT = 180;
+const FRAME_DEFAULT_STYLE = {
+  title: "分组框",
+  stroke: "#2563eb",
+  fill: "#2563eb",
+  fillOpacity: 8,
+  borderWidth: 2,
+  dashed: true
+};
+const FRAME_LAYER_ACTIONS = {
+  bottom: "置底",
+  down: "下移一层",
+  up: "上移一层",
+  top: "置顶"
+};
 const state = {
   project: {
     id: "enterprise-campus",
@@ -99,7 +118,7 @@ const state = {
   zoom: 1,
   running: false,
   seconds: 0,
-  counters: { node: 1, link: 1, packet: 1, text: 1 },
+  counters: { node: 1, link: 1, packet: 1, text: 1, frame: 1 },
   cliMode: "user",
   cliInterface: null,
   cliVlan: null,
@@ -116,6 +135,8 @@ const state = {
 let drag = null;
 let nodeResize = null;
 let handleTap = { id: null, time: 0 };
+let frameDraw = null;
+let frameResize = null;
 let lasso = null;
 let windowDrag = null;
 let stagePan = null;
@@ -187,7 +208,7 @@ function init() {
 }
 
 function bindToolbar() {
-  ["select", "link", "text", "delete"].forEach((tool) => {
+  ["select", "link", "text", "frame", "delete"].forEach((tool) => {
     $(`${tool}Tool`).addEventListener("click", () => setTool(tool));
   });
   $("startBtn").addEventListener("click", startSimulation);
@@ -212,6 +233,7 @@ function bindToolbar() {
   $("downloadConfig").addEventListener("click", downloadConfig);
   $("stage").addEventListener("click", clearSelection);
   $("stage").addEventListener("mousedown", startLasso);
+  $("stage").addEventListener("mousedown", startFrameDraw);
   $("stageViewport").addEventListener("mousedown", startStagePan);
   $("stageViewport").addEventListener("wheel", zoomWithWheel, { passive: false });
   $("stageViewport").addEventListener("scroll", scheduleUiStateSave, { passive: true });
@@ -225,6 +247,8 @@ function bindToolbar() {
   document.querySelectorAll("[data-template]").forEach((btn) => btn.addEventListener("click", () => loadTemplate(btn.dataset.template)));
   document.addEventListener("mousemove", onDragMove);
   document.addEventListener("mousemove", onNodeResize);
+  document.addEventListener("mousemove", onFrameDrawMove);
+  document.addEventListener("mousemove", onFrameResizeMove);
   document.addEventListener("mousemove", onLassoMove);
   document.addEventListener("mousemove", onWindowDrag);
   document.addEventListener("mousemove", onStagePan);
@@ -232,6 +256,8 @@ function bindToolbar() {
   document.addEventListener("mousemove", onBottomPanelResize);
   document.addEventListener("mouseup", stopDrag);
   document.addEventListener("mouseup", stopNodeResize);
+  document.addEventListener("mouseup", stopFrameDraw);
+  document.addEventListener("mouseup", stopFrameResize);
   document.addEventListener("mouseup", stopLasso);
   document.addEventListener("mouseup", stopWindowDrag);
   document.addEventListener("mouseup", stopStagePan);
@@ -344,11 +370,248 @@ function renderDevices() {
   });
 }
 
+// ---- 画框（背景分组框） ----
+
+function isFrameAnnotation(note) {
+  return note?.type === "frame";
+}
+
+function isTextAnnotation(note) {
+  return Boolean(note) && !isFrameAnnotation(note);
+}
+
+function textAnnotations() {
+  return state.annotations.filter(isTextAnnotation);
+}
+
+function frameAnnotations() {
+  return state.annotations.filter(isFrameAnnotation);
+}
+
+function frameStack() {
+  return state.annotations
+    .map((note, index) => ({ note, index }))
+    .filter(({ note }) => isFrameAnnotation(note))
+    .sort((a, b) => (Number(a.note.z) || 0) - (Number(b.note.z) || 0) || a.index - b.index)
+    .map(({ note }) => note);
+}
+
+function normalizeFrameZ() {
+  frameStack().forEach((note, index) => {
+    note.z = index;
+  });
+}
+
+function normalizeFrameColor(value, fallback) {
+  const text = String(value || "").trim().toLowerCase();
+  if (/^#[0-9a-f]{6}$/.test(text)) return text;
+  if (/^#[0-9a-f]{3}$/.test(text)) return `#${text.slice(1).split("").map((ch) => ch + ch).join("")}`;
+  return fallback;
+}
+
+function colorWithAlpha(hex, opacity) {
+  const value = normalizeFrameColor(hex, FRAME_DEFAULT_STYLE.fill).slice(1);
+  const red = Number.parseInt(value.slice(0, 2), 16);
+  const green = Number.parseInt(value.slice(2, 4), 16);
+  const blue = Number.parseInt(value.slice(4, 6), 16);
+  return `rgba(${red}, ${green}, ${blue}, ${clamp(Number(opacity) || 0, 0, 50) / 100})`;
+}
+
+function clampFrameToStage(frame) {
+  const stageWidth = Math.max(FRAME_MIN_WIDTH, state.stage.width);
+  const stageHeight = Math.max(FRAME_MIN_HEIGHT, state.stage.height);
+  frame.width = clamp(Number(frame.width) || FRAME_DEFAULT_WIDTH, FRAME_MIN_WIDTH, stageWidth);
+  frame.height = clamp(Number(frame.height) || FRAME_DEFAULT_HEIGHT, FRAME_MIN_HEIGHT, stageHeight);
+  frame.x = clamp(Number.isFinite(Number(frame.x)) ? Number(frame.x) : 0, 0, Math.max(0, stageWidth - frame.width));
+  frame.y = clamp(Number.isFinite(Number(frame.y)) ? Number(frame.y) : 0, 0, Math.max(0, stageHeight - frame.height));
+  return frame;
+}
+
+function nextAnnotationId(type) {
+  const isFrame = type === "frame";
+  const key = isFrame ? "frame" : "text";
+  const prefix = isFrame ? "f" : "t";
+  let id = "";
+  do {
+    id = `${prefix}${state.counters[key]++}`;
+  } while (state.annotations.some((note) => note.id === id));
+  return id;
+}
+
+function normalizeAnnotationItem(note, index = 0) {
+  if (!note || typeof note !== "object") return null;
+  if (isFrameAnnotation(note)) {
+    const opacity = Number(note.fillOpacity);
+    const borderWidth = Number(note.borderWidth);
+    return clampFrameToStage({
+      id: String(note.id || `f${index + 1}`),
+      type: "frame",
+      x: Number(note.x) || 0,
+      y: Number(note.y) || 0,
+      width: Number(note.width) || FRAME_DEFAULT_WIDTH,
+      height: Number(note.height) || FRAME_DEFAULT_HEIGHT,
+      title: note.title == null ? FRAME_DEFAULT_STYLE.title : String(note.title),
+      stroke: normalizeFrameColor(note.stroke, FRAME_DEFAULT_STYLE.stroke),
+      fill: normalizeFrameColor(note.fill, FRAME_DEFAULT_STYLE.fill),
+      fillOpacity: clamp(Number.isFinite(opacity) ? opacity : FRAME_DEFAULT_STYLE.fillOpacity, 0, 50),
+      borderWidth: clamp(Number.isFinite(borderWidth) ? borderWidth : FRAME_DEFAULT_STYLE.borderWidth, 1, 8),
+      dashed: note.dashed !== false,
+      z: Number.isFinite(Number(note.z)) ? Number(note.z) : index
+    });
+  }
+  return {
+    id: String(note.id || `t${index + 1}`),
+    type: "text",
+    text: String(note.text ?? "文本标注"),
+    x: clamp(Number(note.x) || 80, 16, maxNodeX()),
+    y: clamp(Number(note.y) || 80, 16, maxNodeY())
+  };
+}
+
+function normalizeAnnotations(list) {
+  if (!Array.isArray(list)) return [];
+  const notes = list.map((note, index) => normalizeAnnotationItem(note, index)).filter(Boolean);
+  const used = new Set();
+  notes.forEach((note, index) => {
+    const base = note.id || `${isFrameAnnotation(note) ? "f" : "t"}${index + 1}`;
+    let id = base;
+    let suffix = 2;
+    while (used.has(id)) {
+      id = `${base}-${suffix++}`;
+    }
+    note.id = id;
+    used.add(id);
+  });
+  notes
+    .map((note, index) => ({ note, index }))
+    .filter(({ note }) => isFrameAnnotation(note))
+    .sort((a, b) => (Number(a.note.z) || 0) - (Number(b.note.z) || 0) || a.index - b.index)
+    .forEach(({ note }, index) => {
+      note.z = index;
+    });
+  return notes;
+}
+
+function selectedFrame() {
+  if (state.multiSelected.length || state.multiAnnotations.length) return null;
+  if (state.selected?.kind !== "annotation") return null;
+  const note = getAnnotation(state.selected.id);
+  return isFrameAnnotation(note) ? note : null;
+}
+
+function editFrameTitle(id) {
+  const frame = getAnnotation(id);
+  if (!isFrameAnnotation(frame)) return;
+  const next = window.prompt("编辑画框标题（可留空）", frame.title || "");
+  if (next === null) return;
+  frame.title = next.trim();
+  renderAll();
+}
+
+function createFrame(rect = {}) {
+  const frame = clampFrameToStage({
+    id: nextAnnotationId("frame"),
+    type: "frame",
+    x: Number(rect.x) || 0,
+    y: Number(rect.y) || 0,
+    width: Number(rect.width) || FRAME_DEFAULT_WIDTH,
+    height: Number(rect.height) || FRAME_DEFAULT_HEIGHT,
+    title: FRAME_DEFAULT_STYLE.title,
+    stroke: FRAME_DEFAULT_STYLE.stroke,
+    fill: FRAME_DEFAULT_STYLE.fill,
+    fillOpacity: FRAME_DEFAULT_STYLE.fillOpacity,
+    borderWidth: FRAME_DEFAULT_STYLE.borderWidth,
+    dashed: FRAME_DEFAULT_STYLE.dashed,
+    z: (frameStack().at(-1)?.z ?? -1) + 1
+  });
+  state.annotations.push(frame);
+  normalizeFrameZ();
+  state.selected = { kind: "annotation", id: frame.id };
+  state.multiSelected = [];
+  state.multiAnnotations = [];
+  log("info", "FRAME", `新增画框 ${frame.id}`);
+  toast("已创建画框：拖动标题或边框移动，拖动控制点缩放。");
+  renderAll();
+  return frame;
+}
+
+function moveFrameLayer(id, action) {
+  const stack = frameStack();
+  const index = stack.findIndex((note) => note.id === id);
+  if (index < 0) return false;
+  let target = index;
+  if (action === "bottom") target = 0;
+  if (action === "down") target = Math.max(0, index - 1);
+  if (action === "up") target = Math.min(stack.length - 1, index + 1);
+  if (action === "top") target = stack.length - 1;
+  if (target === index) {
+    const boundary = index === 0 ? "最底层" : "最顶层";
+    toast(`${stack[index].title || "画框"} 已在${boundary}。`);
+    return false;
+  }
+  const [frame] = stack.splice(index, 1);
+  stack.splice(target, 0, frame);
+  stack.forEach((note, position) => {
+    note.z = position;
+  });
+  log("info", "LAYER", `画框 ${frame.title || frame.id} ${FRAME_LAYER_ACTIONS[action]} → 第 ${target + 1}/${stack.length} 层`);
+  toast(`画框已${FRAME_LAYER_ACTIONS[action]}（第 ${target + 1}/${stack.length} 层）`);
+  renderAll();
+  return true;
+}
+
+function renderFrames() {
+  const layer = $("frameLayer");
+  if (!layer) return;
+  layer.innerHTML = "";
+  frameStack().forEach((frame) => {
+    const selected = isSelected("annotation", frame.id) || state.multiAnnotations.includes(frame.id);
+    const el = document.createElement("div");
+    el.className = `frame ${selected ? "selected" : ""}`;
+    el.dataset.id = frame.id;
+    el.style.left = `${frame.x}px`;
+    el.style.top = `${frame.y}px`;
+    el.style.width = `${frame.width}px`;
+    el.style.height = `${frame.height}px`;
+    el.style.borderStyle = frame.dashed ? "dashed" : "solid";
+    el.style.borderWidth = `${frame.borderWidth}px`;
+    el.style.borderColor = frame.stroke;
+    el.style.background = colorWithAlpha(frame.fill, frame.fillOpacity);
+    el.innerHTML = `
+      <span class="frame-label" title="双击修改标题">${escapeHtml(frame.title || "未命名")}</span>
+      <span class="frame-edge top"></span><span class="frame-edge right"></span>
+      <span class="frame-edge bottom"></span><span class="frame-edge left"></span>`;
+    if (selected && !state.multiAnnotations.length && !state.multiSelected.length) {
+      ["nw", "n", "ne", "e", "se", "s", "sw", "w"].forEach((handle) => {
+        const grip = document.createElement("span");
+        grip.className = `frame-handle ${handle}`;
+        grip.dataset.handle = handle;
+        grip.title = "拖动调整画框大小";
+        grip.addEventListener("mousedown", (event) => startFrameResize(event, frame.id, handle));
+        grip.addEventListener("click", (event) => event.stopPropagation());
+        el.appendChild(grip);
+      });
+    }
+    el.addEventListener("mousedown", (event) => startAnnotationDrag(event, frame.id));
+    el.addEventListener("click", (event) => {
+      event.stopPropagation();
+      handleAnnotationClick(frame.id, event);
+    });
+    el.addEventListener("dblclick", (event) => {
+      event.stopPropagation();
+      editFrameTitle(frame.id);
+    });
+    el.addEventListener("contextmenu", (event) => showContextMenu(event, "frame", frame.id));
+    layer.appendChild(el);
+  });
+}
+
 function renderAnnotations() {
+  renderFrames();
   const layer = $("annotationLayer");
   if (!layer) return;
   layer.innerHTML = "";
-  state.annotations.forEach((note) => {
+  textAnnotations().forEach((note) => {
     const el = document.createElement("div");
     el.className = `annotation ${isSelected("annotation", note.id) || state.multiAnnotations.includes(note.id) ? "selected" : ""}`;
     el.style.left = `${note.x}px`;
@@ -640,7 +903,8 @@ function handleAnnotationClick(id, event = null) {
 
 function addAnnotationAt(point) {
   const note = {
-    id: `t${state.counters.text++}`,
+    id: nextAnnotationId("text"),
+    type: "text",
     text: "文本标注",
     x: clamp(point.x, 16, maxNodeX()),
     y: clamp(point.y, 16, maxNodeY())
@@ -654,6 +918,7 @@ function addAnnotationAt(point) {
 function editAnnotation(id) {
   const note = getAnnotation(id);
   if (!note) return;
+  if (isFrameAnnotation(note)) return editFrameTitle(id);
   const next = prompt("修改文本标注", note.text);
   if (next === null) return;
   note.text = next.trim() || note.text;
@@ -689,6 +954,20 @@ function showContextMenu(event, kind, id) {
       <button data-action="back">置底 <span>Ctrl+Shift+[</span></button>
       ${node.autoSize === false ? '<button data-action="autosize">恢复自动尺寸 <span>Auto</span></button>' : ""}
       <button data-action="delete" class="danger-item">删除 <span>Del</span></button>`;
+  } else if (kind === "frame") {
+    const frame = getAnnotation(id);
+    if (!frame) return;
+    const stack = frameStack();
+    const index = stack.findIndex((note) => note.id === id);
+    const total = stack.length;
+    menu.innerHTML = `
+      <button data-action="select">选择画框 <span>${escapeHtml(frame.title || "未命名")}</span></button>
+      <button data-action="rename">编辑标题 <span>Edit</span></button>
+      <button data-action="front" ${index === total - 1 ? "disabled" : ""}>置顶 <span>Ctrl+Shift+]</span></button>
+      <button data-action="raise" ${index === total - 1 ? "disabled" : ""}>上移一层 <span>Ctrl+]</span></button>
+      <button data-action="lower" ${index === 0 ? "disabled" : ""}>下移一层 <span>Ctrl+[</span></button>
+      <button data-action="back" ${index === 0 ? "disabled" : ""}>置底 <span>Ctrl+Shift+[</span></button>
+      <button data-action="delete" class="danger-item">删除画框 <span>Del</span></button>`;
   } else {
     const link = getLink(id);
     menu.innerHTML = `
@@ -772,6 +1051,26 @@ function runContextAction(kind, id, action) {
       }
     }
     if (action === "delete") deleteNode(id);
+  } else if (kind === "frame") {
+    const frame = getAnnotation(id);
+    if (!frame) return;
+    if (["front", "back", "raise", "lower"].includes(action)) {
+      const mapping = { front: "top", back: "bottom", raise: "up", lower: "down" };
+      moveFrameLayer(id, mapping[action]);
+      return;
+    }
+    if (action === "rename") {
+      state.selected = { kind: "annotation", id };
+      state.multiSelected = [];
+      state.multiAnnotations = [];
+      editFrameTitle(id);
+      return;
+    }
+    if (action === "select") state.selected = { kind: "annotation", id };
+    if (action === "delete") {
+      deleteAnnotation(id);
+      return;
+    }
   } else {
     const link = getLink(id);
     if (!link) return;
@@ -963,6 +1262,163 @@ function reorderSelectedNode(action) {
   reorderNode(state.selected.id, action);
 }
 
+// ---- 画框交互 ----
+
+function frameRectFor(draw) {
+  const left = clamp(Math.min(draw.startX, draw.x), 0, state.stage.width);
+  const top = clamp(Math.min(draw.startY, draw.y), 0, state.stage.height);
+  const right = clamp(Math.max(draw.startX, draw.x), 0, state.stage.width);
+  const bottom = clamp(Math.max(draw.startY, draw.y), 0, state.stage.height);
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+function updateFrameDraft() {
+  if (!frameDraw?.draft) return;
+  const rect = frameRectFor(frameDraw);
+  frameDraw.draft.style.left = `${rect.x}px`;
+  frameDraw.draft.style.top = `${rect.y}px`;
+  frameDraw.draft.style.width = `${rect.width}px`;
+  frameDraw.draft.style.height = `${rect.height}px`;
+  const size = frameDraw.draft.querySelector(".frame-draft-size");
+  if (size) size.textContent = `${Math.round(rect.width)} × ${Math.round(rect.height)}`;
+}
+
+function startFrameDraw(event) {
+  if (state.tool !== "frame" || event.button !== 0) return;
+  if (event.target?.closest?.(".device, .annotation, .frame, .selection-rect, .link-hit, .link, .link-label, .link-endpoint")) return;
+  event.preventDefault();
+  cancelFrameDraw();
+  const point = stagePoint(event);
+  const draft = document.createElement("div");
+  draft.className = "frame frame-draft";
+  draft.innerHTML = '<span class="frame-draft-size">0 × 0</span>';
+  $("frameLayer")?.appendChild(draft);
+  frameDraw = {
+    startX: clamp(point.x, 0, state.stage.width),
+    startY: clamp(point.y, 0, state.stage.height),
+    x: clamp(point.x, 0, state.stage.width),
+    y: clamp(point.y, 0, state.stage.height),
+    moved: false,
+    draft
+  };
+  updateFrameDraft();
+}
+
+function onFrameDrawMove(event) {
+  if (!frameDraw) return;
+  const point = stagePoint(event);
+  frameDraw.x = clamp(point.x, 0, state.stage.width);
+  frameDraw.y = clamp(point.y, 0, state.stage.height);
+  if (Math.abs(frameDraw.x - frameDraw.startX) > 3 || Math.abs(frameDraw.y - frameDraw.startY) > 3) {
+    frameDraw.moved = true;
+  }
+  updateFrameDraft();
+}
+
+function stopFrameDraw() {
+  if (!frameDraw) return;
+  const draw = frameDraw;
+  frameDraw = null;
+  draw.draft.remove();
+  let rect = frameRectFor(draw);
+  if (!draw.moved) {
+    rect = { x: draw.startX, y: draw.startY, width: FRAME_DEFAULT_WIDTH, height: FRAME_DEFAULT_HEIGHT };
+  } else {
+    rect.width = Math.max(FRAME_MIN_WIDTH, rect.width);
+    rect.height = Math.max(FRAME_MIN_HEIGHT, rect.height);
+  }
+  setTool("select");
+  createFrame(rect);
+  suppressStageClick = true;
+  suppressNodeClick = true;
+  suppressAnnotationClick = true;
+}
+
+function cancelFrameDraw() {
+  frameDraw?.draft?.remove();
+  frameDraw = null;
+}
+
+function startFrameResize(event, id, handle) {
+  if (state.tool !== "select" || event.button !== 0) return;
+  const frame = getAnnotation(id);
+  if (!isFrameAnnotation(frame)) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const point = stagePoint(event);
+  frameResize = {
+    id,
+    handle,
+    startX: point.x,
+    startY: point.y,
+    original: { x: frame.x, y: frame.y, width: frame.width, height: frame.height },
+    moved: false
+  };
+  state.selected = { kind: "annotation", id };
+  state.multiSelected = [];
+  state.multiAnnotations = [];
+  renderInspector();
+}
+
+function onFrameResizeMove(event) {
+  if (!frameResize) return;
+  const frame = getAnnotation(frameResize.id);
+  if (!isFrameAnnotation(frame)) {
+    frameResize = null;
+    return;
+  }
+  const point = stagePoint(event);
+  const { original, handle } = frameResize;
+  const dx = point.x - frameResize.startX;
+  const dy = point.y - frameResize.startY;
+  let left = original.x;
+  let top = original.y;
+  let right = original.x + original.width;
+  let bottom = original.y + original.height;
+  if (handle.includes("w")) left = original.x + dx;
+  if (handle.includes("e")) right = original.x + original.width + dx;
+  if (handle.includes("n")) top = original.y + dy;
+  if (handle.includes("s")) bottom = original.y + original.height + dy;
+  if (handle.includes("w")) left = Math.min(left, right - FRAME_MIN_WIDTH);
+  if (handle.includes("e")) right = Math.max(right, left + FRAME_MIN_WIDTH);
+  if (handle.includes("n")) top = Math.min(top, bottom - FRAME_MIN_HEIGHT);
+  if (handle.includes("s")) bottom = Math.max(bottom, top + FRAME_MIN_HEIGHT);
+  left = clamp(left, 0, state.stage.width - FRAME_MIN_WIDTH);
+  right = clamp(right, FRAME_MIN_WIDTH, state.stage.width);
+  top = clamp(top, 0, state.stage.height - FRAME_MIN_HEIGHT);
+  bottom = clamp(bottom, FRAME_MIN_HEIGHT, state.stage.height);
+  if (right - left < FRAME_MIN_WIDTH) {
+    if (handle.includes("w")) left = right - FRAME_MIN_WIDTH;
+    else right = left + FRAME_MIN_WIDTH;
+  }
+  if (bottom - top < FRAME_MIN_HEIGHT) {
+    if (handle.includes("n")) top = bottom - FRAME_MIN_HEIGHT;
+    else bottom = top + FRAME_MIN_HEIGHT;
+  }
+  frame.x = left;
+  frame.y = top;
+  frame.width = right - left;
+  frame.height = bottom - top;
+  frameResize.moved = true;
+  const el = document.querySelector(`.frame[data-id="${frameResize.id}"]`);
+  if (el) {
+    el.style.left = `${frame.x}px`;
+    el.style.top = `${frame.y}px`;
+    el.style.width = `${frame.width}px`;
+    el.style.height = `${frame.height}px`;
+  }
+}
+
+function stopFrameResize() {
+  if (!frameResize) return;
+  const moved = frameResize.moved;
+  frameResize = null;
+  if (!moved) return;
+  suppressStageClick = true;
+  suppressAnnotationClick = true;
+  renderAll();
+}
+
 function startAnnotationDrag(event, id) {
   if (state.tool !== "select" || event.button !== 0) return;
   const note = getAnnotation(id);
@@ -998,10 +1454,15 @@ function onAnnotationDrag(event) {
   }
   const note = getAnnotation(annotationDrag.id);
   if (!note) return;
-  note.x = clamp(point.x - annotationDrag.dx, 16, maxNodeX());
-  note.y = clamp(point.y - annotationDrag.dy, 16, maxNodeY());
+  if (isFrameAnnotation(note)) {
+    note.x = clamp(point.x - annotationDrag.dx, 0, Math.max(0, state.stage.width - note.width));
+    note.y = clamp(point.y - annotationDrag.dy, 0, Math.max(0, state.stage.height - note.height));
+  } else {
+    note.x = clamp(point.x - annotationDrag.dx, 16, maxNodeX());
+    note.y = clamp(point.y - annotationDrag.dy, 16, maxNodeY());
+  }
   annotationDrag.moved = true;
-  const el = document.querySelector(`.annotation[data-id="${annotationDrag.id}"]`);
+  const el = document.querySelector(`.${isFrameAnnotation(note) ? "frame" : "annotation"}[data-id="${annotationDrag.id}"]`);
   if (el) {
     el.style.left = `${note.x}px`;
     el.style.top = `${note.y}px`;
@@ -1055,9 +1516,14 @@ function moveSelectionDrag(selectionDrag, point) {
     const note = getAnnotation(noteId);
     const original = selectionDrag.annotationOriginals[noteId];
     if (!note || !original) return;
-    note.x = clamp(original.x + dx, 16, maxNodeX());
-    note.y = clamp(original.y + dy, 16, maxNodeY());
-    const el = document.querySelector(`.annotation[data-id="${noteId}"]`);
+    if (isFrameAnnotation(note)) {
+      note.x = clamp(original.x + dx, 0, Math.max(0, state.stage.width - note.width));
+      note.y = clamp(original.y + dy, 0, Math.max(0, state.stage.height - note.height));
+    } else {
+      note.x = clamp(original.x + dx, 16, maxNodeX());
+      note.y = clamp(original.y + dy, 16, maxNodeY());
+    }
+    const el = document.querySelector(`.${isFrameAnnotation(note) ? "frame" : "annotation"}[data-id="${noteId}"]`);
     if (el) {
       el.style.left = `${note.x}px`;
       el.style.top = `${note.y}px`;
@@ -1071,6 +1537,7 @@ function startLasso(event) {
   if (
     event.target.closest?.(".device") ||
     event.target.closest?.(".annotation") ||
+    event.target.closest?.(".frame") ||
     classList?.contains("link-hit") ||
     classList?.contains("link") ||
     classList?.contains("link-label") ||
@@ -1131,9 +1598,9 @@ function stopLasso() {
 }
 
 function annotationIntersectsBox(note, box) {
-  const el = document.querySelector(`.annotation[data-id="${note.id}"]`);
-  const width = el?.offsetWidth || 80;
-  const height = el?.offsetHeight || 28;
+  const el = isFrameAnnotation(note) ? null : document.querySelector(`.annotation[data-id="${note.id}"]`);
+  const width = isFrameAnnotation(note) ? note.width : (el?.offsetWidth || 80);
+  const height = isFrameAnnotation(note) ? note.height : (el?.offsetHeight || 28);
   const left = note.x;
   const right = note.x + width;
   const top = note.y;
@@ -1357,6 +1824,13 @@ function renderInspector() {
   if (state.selected.kind === "annotation") {
     const note = getAnnotation(state.selected.id);
     if (!note) return;
+    if (isFrameAnnotation(note)) {
+      $("objectType").textContent = "Frame";
+      label.textContent = "矩形框";
+      body.innerHTML = frameInspector(note);
+      bindFrameInspector(note);
+      return;
+    }
     $("objectType").textContent = "Text";
     label.textContent = "文本标注";
     body.innerHTML = annotationInspector(note);
@@ -3079,6 +3553,8 @@ function stopWindowDrag() {
 function bulkInspector() {
   const nodes = state.multiSelected.map(getNode).filter(Boolean);
   const annotations = state.multiAnnotations.map(getAnnotation).filter(Boolean);
+  const frames = annotations.filter(isFrameAnnotation);
+  const texts = annotations.filter(isTextAnnotation);
   const running = nodes.filter((node) => node.running).length;
   const types = [...new Set(nodes.map((node) => node.model))].join(", ");
   const total = nodes.length + annotations.length;
@@ -3086,7 +3562,7 @@ function bulkInspector() {
     <div class="kv">
       <div><span>已选择</span><strong>${total}</strong></div>
       <div><span>设备</span><strong>${nodes.length}</strong></div>
-      <div><span>文本</span><strong>${annotations.length}</strong></div>
+      <div><span>文本 / 画框</span><strong>${texts.length} / ${frames.length}</strong></div>
       <div><span>运行</span><strong>${running}/${nodes.length}</strong></div>
       <div><span>型号</span><strong>${escapeHtml(types)}</strong></div>
     </div>
@@ -3098,7 +3574,8 @@ function bulkInspector() {
     </div>
     <div class="port-list">
       ${nodes.map((node) => `<div class="port-row"><strong>${escapeHtml(node.name)}</strong><span>${escapeHtml(node.model)} · ${node.running ? "Running" : "Stopped"}</span><button data-bulk-focus="${node.id}">定位</button></div>`).join("")}
-      ${annotations.map((note) => `<div class="port-row"><strong>${escapeHtml(note.text)}</strong><span>文本标注</span><button data-bulk-focus-text="${note.id}">定位</button></div>`).join("")}
+      ${texts.map((note) => `<div class="port-row"><strong>${escapeHtml(note.text)}</strong><span>文本标注</span><button data-bulk-focus-text="${note.id}">定位</button></div>`).join("")}
+      ${frames.map((note) => `<div class="port-row"><strong>${escapeHtml(note.title || "未命名")}</strong><span>矩形框 · 第 ${frameStack().findIndex((frame) => frame.id === note.id) + 1} 层</span><button data-bulk-focus-text="${note.id}">定位</button></div>`).join("")}
     </div>`;
 }
 
@@ -3137,12 +3614,15 @@ function bulkPower(running) {
 function bulkDelete() {
   const ids = new Set(state.multiSelected);
   const noteIds = new Set(state.multiAnnotations);
+  const removed = state.annotations.filter((note) => noteIds.has(note.id));
+  const removedFrames = removed.filter(isFrameAnnotation).length;
+  const removedTexts = removed.length - removedFrames;
   ids.forEach(closeNodeWindows);
   state.nodes = state.nodes.filter((node) => !ids.has(node.id));
   state.links = state.links.filter((link) => !ids.has(link.a) && !ids.has(link.b));
   rebuildLinkIndex();
   state.annotations = state.annotations.filter((note) => !noteIds.has(note.id));
-  log("warn", "BULK", `删除 ${ids.size} 台设备、${noteIds.size} 个文本标注`);
+  log("warn", "BULK", `删除 ${ids.size} 台设备、${removedTexts} 个文本标注、${removedFrames} 个画框`);
   state.multiSelected = [];
   state.multiAnnotations = [];
   state.selected = null;
@@ -3334,6 +3814,7 @@ function resizeStage(width, height) {
     node.x = clamp(node.x, 16, maxNodeX(node));
     node.y = clamp(node.y, 16, maxNodeY(node));
   });
+  frameAnnotations().forEach((frame) => clampFrameToStage(frame));
   log("info", "CANVAS", `画布大小 ${state.stage.width} x ${state.stage.height}`);
   renderAll();
 }
@@ -3530,6 +4011,91 @@ function bindLinkInspector(link) {
       if (!btn.dataset.linkFocus) return;
       state.selected = { kind: "node", id: btn.dataset.linkFocus };
       centerNode(btn.dataset.linkFocus);
+      renderAll();
+    });
+  });
+}
+
+function frameInspector(frame) {
+  const stack = frameStack();
+  const index = stack.findIndex((note) => note.id === frame.id);
+  const total = stack.length;
+  const layerList = [...stack].reverse().map((note, reverseIndex) => {
+    const position = total - reverseIndex;
+    const suffix = position === total ? "顶层" : position === 1 ? "底层" : `第 ${position} 层`;
+    return `<button data-frame-select="${note.id}" class="${note.id === frame.id ? "active" : ""}" title="选择该画框"><span>${position}. ${escapeHtml(note.title || "未命名")}</span><small>${suffix}</small></button>`;
+  }).join("");
+  return `
+    <div class="field"><label>标题</label><input id="frameTitle" value="${escapeHtml(frame.title)}" placeholder="可留空" /></div>
+    <div class="pc-form">
+      <div class="field"><label>X</label><input id="frameX" type="number" value="${Math.round(frame.x)}" /></div>
+      <div class="field"><label>Y</label><input id="frameY" type="number" value="${Math.round(frame.y)}" /></div>
+    </div>
+    <div class="pc-form">
+      <div class="field"><label>宽度</label><input id="frameWidth" type="number" min="${FRAME_MIN_WIDTH}" step="10" value="${Math.round(frame.width)}" /></div>
+      <div class="field"><label>高度</label><input id="frameHeight" type="number" min="${FRAME_MIN_HEIGHT}" step="10" value="${Math.round(frame.height)}" /></div>
+    </div>
+    <div class="pc-form">
+      <div class="field"><label>描边颜色</label><input id="frameStroke" type="color" value="${frame.stroke}" /></div>
+      <div class="field"><label>填充颜色</label><input id="frameFill" type="color" value="${frame.fill}" /></div>
+    </div>
+    <div class="field"><label>填充透明度：<span data-frame-opacity-label>${Math.round(frame.fillOpacity)}</span>%</label>
+      <input id="frameOpacity" type="range" min="0" max="50" step="1" value="${Math.round(frame.fillOpacity)}" />
+    </div>
+    <div class="pc-form">
+      <div class="field"><label>边框线宽</label><input id="frameBorder" type="number" min="1" max="8" step="1" value="${Math.round(frame.borderWidth)}" /></div>
+      <div class="field"><label>边框样式</label><label class="checkbox-row"><input id="frameDashed" type="checkbox" ${frame.dashed ? "checked" : ""} /> 虚线</label></div>
+    </div>
+    <div class="field"><label>图层顺序（顶层优先）</label>
+      <div class="frame-layer-meta">第 <strong>${index + 1}</strong> / ${total} 层</div>
+      <div class="button-row layer-row">
+        <button data-frame-layer="bottom" ${index === 0 ? "disabled" : ""}>置底</button>
+        <button data-frame-layer="down" ${index === 0 ? "disabled" : ""}>下移一层</button>
+        <button data-frame-layer="up" ${index === total - 1 ? "disabled" : ""}>上移一层</button>
+        <button data-frame-layer="top" ${index === total - 1 ? "disabled" : ""}>置顶</button>
+      </div>
+      <div class="frame-layer-list">${layerList}</div>
+    </div>
+    <div class="button-row">
+      <button id="applyFrame" class="primary-btn">应用</button>
+      <button id="deleteFrame" class="danger-btn">删除画框</button>
+    </div>
+    <p class="size-hint">拖动标题或边框移动画框，拖动控制点缩放；框内部不拦截设备/链路操作。</p>`;
+}
+
+function bindFrameInspector(frame) {
+  const apply = () => {
+    frame.title = $("frameTitle").value.trim();
+    const x = Number($("frameX").value);
+    const y = Number($("frameY").value);
+    const width = Number($("frameWidth").value);
+    const height = Number($("frameHeight").value);
+    if (Number.isFinite(x)) frame.x = x;
+    if (Number.isFinite(y)) frame.y = y;
+    if (Number.isFinite(width)) frame.width = width;
+    if (Number.isFinite(height)) frame.height = height;
+    frame.stroke = normalizeFrameColor($("frameStroke").value, frame.stroke);
+    frame.fill = normalizeFrameColor($("frameFill").value, frame.fill);
+    frame.fillOpacity = clamp(Number($("frameOpacity").value) || 0, 0, 50);
+    frame.borderWidth = clamp(Number($("frameBorder").value) || FRAME_DEFAULT_STYLE.borderWidth, 1, 8);
+    frame.dashed = $("frameDashed").checked;
+    clampFrameToStage(frame);
+    renderAll();
+  };
+  $("frameOpacity")?.addEventListener("input", (event) => {
+    const label = document.querySelector("[data-frame-opacity-label]");
+    if (label) label.textContent = event.target.value;
+  });
+  $("applyFrame")?.addEventListener("click", apply);
+  $("deleteFrame")?.addEventListener("click", () => deleteAnnotation(frame.id));
+  document.querySelectorAll("[data-frame-layer]").forEach((btn) => {
+    btn.addEventListener("click", () => moveFrameLayer(frame.id, btn.dataset.frameLayer));
+  });
+  document.querySelectorAll("[data-frame-select]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.selected = { kind: "annotation", id: btn.dataset.frameSelect };
+      state.multiSelected = [];
+      state.multiAnnotations = [];
       renderAll();
     });
   });
@@ -4526,7 +5092,7 @@ function loadTemplate(name) {
   flashingLinks.clear();
   state.pendingLink = null;
   state.pendingPing = null;
-  state.counters = { node: 1, link: 1, packet: 1, text: 1 };
+  state.counters = { node: 1, link: 1, packet: 1, text: 1, frame: 1 };
   if (name === "empty") {
     log("info", "TEMPLATE", "创建空白拓扑");
     return renderAll();
@@ -4796,7 +5362,8 @@ function setTool(tool) {
   state.tool = tool;
   state.pendingLink = null;
   state.pendingPing = null;
-  ["select", "link", "text", "delete"].forEach((name) => $(`${name}Tool`).classList.toggle("active", name === tool));
+  ["select", "link", "text", "frame", "delete"].forEach((name) => $(`${name}Tool`).classList.toggle("active", name === tool));
+  $("stage").classList.toggle("frame-mode", tool === "frame");
 }
 
 function setZoom(value) {
@@ -5079,12 +5646,26 @@ function handleGlobalHotkeys(event) {
   }
   if (event.code === "BracketRight") {
     event.preventDefault();
-    reorderSelectedNode(event.shiftKey ? "front" : "raise");
+    reorderSelectedLayer(event.shiftKey ? "front" : "raise");
   }
   if (event.code === "BracketLeft") {
     event.preventDefault();
-    reorderSelectedNode(event.shiftKey ? "back" : "lower");
+    reorderSelectedLayer(event.shiftKey ? "back" : "lower");
   }
+}
+
+function reorderSelectedLayer(action) {
+  const frame = selectedFrame();
+  if (frame) {
+    const mapping = { front: "top", raise: "up", lower: "down", back: "bottom" };
+    moveFrameLayer(frame.id, mapping[action] || action);
+    return;
+  }
+  if (state.selected?.kind === "annotation") {
+    toast("调整图层请先选择单台设备或画框。");
+    return;
+  }
+  reorderSelectedNode(action);
 }
 
 function selectedNodeIds() {
@@ -5178,6 +5759,8 @@ function deleteSelection() {
 
 function cancelCurrentAction() {
   document.querySelector(".link-dialog")?.remove();
+  cancelFrameDraw();
+  frameResize = null;
   state.pendingLink = null;
   state.pendingPing = null;
   state.selected = null;
@@ -5532,7 +6115,7 @@ function buildEnsPTopoXml(projectName, idMap = new Map()) {
     const bp = nodeAnchorPoint(b, a);
     return `        <line srcDeviceID="${escapeXml(idMap.get(link.a) || link.a)}" destDeviceID="${escapeXml(idMap.get(link.b) || link.b)}">\n            <interfacePair lineName="${escapeXml(normalizeCableName(link.cable))}" srcIndex="${enspPortIndex(a, link.aPort)}" srcBoundRectIsMoved="0" srcBoundRect_X="${ap.x.toFixed(6)}" srcBoundRect_Y="${ap.y.toFixed(6)}" srcOffset_X="0.000000" srcOffset_Y="0.000000" tarIndex="${enspPortIndex(b, link.bPort)}" tarBoundRectIsMoved="0" tarBoundRect_X="${bp.x.toFixed(6)}" tarBoundRect_Y="${bp.y.toFixed(6)}" tarOffset_X="0.000000" tarOffset_Y="0.000000" />\n        </line>`;
   }).join("\n");
-  const tips = state.annotations.map((note) => {
+  const tips = textAnnotations().map((note) => {
     const left = Math.round(note.x);
     const top = Math.round(note.y);
     const right = left + Math.max(70, String(note.text || "").length * 8);
@@ -6222,7 +6805,7 @@ function applyImportedTopology(imported, fileName) {
   flashingLinks.clear();
   state.pendingLink = null;
   state.pendingPing = null;
-  state.counters = { node: 1, link: 1, packet: 1, text: 1 };
+  state.counters = { node: 1, link: 1, packet: 1, text: 1, frame: 1 };
   state.project = {
     id: slugId(imported.projectName || fileName),
     name: imported.projectName || cleanFileName(fileName),
@@ -6252,13 +6835,9 @@ function applyImportedTopology(imported, fileName) {
     if (a && b) addLink(a, b, { aPort: link.aPort, bPort: link.bPort, cable: link.cable || "Auto" });
   });
   if (Array.isArray(imported.annotations)) {
-    state.annotations = imported.annotations.map((note, index) => ({
-      id: note.id || `t${index + 1}`,
-      text: String(note.text || "文本标注"),
-      x: clamp(Number(note.x) || 80, 0, state.stage.width - 40),
-      y: clamp(Number(note.y) || 80, 0, state.stage.height - 24)
-    }));
-    state.counters.text = state.annotations.length + 1;
+    state.annotations = normalizeAnnotations(imported.annotations);
+    state.counters.text = textAnnotations().length + 1;
+    state.counters.frame = frameAnnotations().length + 1;
   }
   updateProjectTitle();
   toast(`已导入拓扑：${withLayout.length} 台设备，${state.links.length} 条链路。`);
@@ -6291,10 +6870,21 @@ function hydrate(data) {
   state.stage = normalizeStageSize(data.stage);
   state.links = (data.links || []).map(serializeLink);
   rebuildLinkIndex();
-  state.annotations = data.annotations || [];
+  state.annotations = normalizeAnnotations(data.annotations || []);
   state.packets = data.packets || [];
   state.events = data.events || [];
-  state.counters = { node: state.nodes.length + 1, link: state.links.length + 1, packet: state.packets.length + 1, text: (state.annotations?.length || 0) + 1, ...(data.counters || {}) };
+  const textCount = textAnnotations().length;
+  const frameCount = frameAnnotations().length;
+  state.counters = {
+    node: state.nodes.length + 1,
+    link: state.links.length + 1,
+    packet: state.packets.length + 1,
+    text: textCount + 1,
+    frame: frameCount + 1,
+    ...(data.counters || {})
+  };
+  state.counters.text = Math.max(Number(state.counters.text) || 1, textCount + 1);
+  state.counters.frame = Math.max(Number(state.counters.frame) || 1, frameCount + 1);
   state.seconds = data.seconds || 0;
   state.selected = null;
   state.multiSelected = [];
@@ -6589,10 +7179,11 @@ function deleteLink(id) {
 }
 
 function deleteAnnotation(id) {
-  state.annotations = state.annotations.filter((note) => note.id !== id);
+  const note = getAnnotation(id);
+  state.annotations = state.annotations.filter((item) => item.id !== id);
   state.multiAnnotations = state.multiAnnotations.filter((noteId) => noteId !== id);
   state.selected = null;
-  log("warn", "DELETE", `删除文本标注 ${id}`);
+  log("warn", "DELETE", isFrameAnnotation(note) ? `删除画框 ${note.title || id}` : `删除文本标注 ${id}`);
   renderAll();
 }
 
